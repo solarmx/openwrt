@@ -2,13 +2,24 @@
 
 Fork of `git.openwrt.org/openwrt/openwrt.git` with SolarMatrix-specific firmware build additions in this directory.
 
+## First-time setup
+
+Run from the repo root (one time, per build machine):
+
+```sh
+./solarmatrix/build-firmware.sh prereqs      # install OpenWRT build deps (apt-get)
+make menuconfig                              # pick target + options, save .config
+```
+
+`.config` is local to your checkout — it is gitignored by OpenWRT. Different build hosts can target different hardware.
+
 ## Build
 
 ```sh
 ./solarmatrix/build-firmware.sh
 ```
 
-Syncs `upstream` → auto-picks the latest `vMAJOR.MINOR.PATCH` tag → checks it out in detached mode → copies `solarmatrix/config.solarmatrix` to `.config` → `make defconfig` → `make -j<nproc>` → emits artifacts to `solarmatrix/out/`.
+Syncs `upstream` → auto-picks the latest `vMAJOR.MINOR.PATCH` tag → checks it out in detached mode → runs `make defconfig` (against your saved `.config`) → `make -j<nproc>` → emits artifacts to `solarmatrix/out/`.
 
 ## Outputs
 

@@ -1,5 +1,0 @@
-# Placeholder OpenWRT .config for SolarMatrix firmware.
-# Replace this with a real .config exported from `make menuconfig` once the
-# target hardware is finalized. The build script will fail fast if this file
-# is still a placeholder (make defconfig will notice missing target options).
-CONFIG_PLACEHOLDER_REPLACE_ME=y

@@ -26,7 +26,6 @@ install_prereqs() {
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$REPO_ROOT/solarmatrix/out"
-CFG_FILE="$REPO_ROOT/solarmatrix/config.solarmatrix"
 
 cd "$REPO_ROOT"
 
@@ -36,6 +35,13 @@ step() { echo -e "\n==== $* ===="; }
 if [ "${1:-}" = "prereqs" ]; then
     install_prereqs
     exit 0
+fi
+
+if [ ! -f "$REPO_ROOT/.config" ]; then
+    echo "ERROR: $REPO_ROOT/.config not found." >&2
+    echo "Run 'make menuconfig' in $REPO_ROOT once to pick the target and save a .config," >&2
+    echo "then re-run this script. (.config is intentionally .gitignored.)" >&2
+    exit 1
 fi
 
 step "Syncing fork from upstream"
@@ -54,8 +60,7 @@ step "Latest stable tag: $LATEST_TAG"
 step "Checking out $LATEST_TAG (detached)"
 git checkout --detach "$LATEST_TAG"
 
-step "Restoring .config from $CFG_FILE"
-cp "$CFG_FILE" .config
+step "Using existing .config (regenerating via defconfig)"
 make defconfig
 
 step "Building (this is slow)"
