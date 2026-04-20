@@ -17,7 +17,7 @@ install_prereqs() {
     sudo apt-get update
     sudo apt-get install -y \
         build-essential clang flex bison g++ gawk \
-        gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+        gettext git libncurses5-dev libssl-dev \
         python3-setuptools python3-dev rsync swig unzip zlib1g-dev file wget \
         device-tree-compiler jq
 
@@ -37,13 +37,6 @@ if [ "${1:-}" = "prereqs" ]; then
     exit 0
 fi
 
-if [ ! -f "$REPO_ROOT/.config" ]; then
-    echo "ERROR: $REPO_ROOT/.config not found." >&2
-    echo "Run 'make menuconfig' in $REPO_ROOT once to pick the target and save a .config," >&2
-    echo "then re-run this script. (.config is intentionally .gitignored.)" >&2
-    exit 1
-fi
-
 step "Syncing fork from upstream"
 git fetch upstream --tags
 git fetch upstream
@@ -57,10 +50,32 @@ if [ -z "$LATEST_TAG" ]; then
 fi
 step "Latest stable tag: $LATEST_TAG"
 
+# Capture the invoking branch before we detach, so we can overlay solarmatrix/
+# from it back onto the tag's tree. This lets the build run AT the upstream
+# tag (stable, reproducible) while keeping our GPL build scripts available.
+INVOKING_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
+if [ -z "$INVOKING_BRANCH" ]; then
+    echo "ERROR: refusing to run on detached HEAD." >&2
+    echo "Check out a branch containing the solarmatrix/ dir first," >&2
+    echo "then re-run this script." >&2
+    exit 1
+fi
+
 step "Checking out $LATEST_TAG (detached)"
 git checkout --detach "$LATEST_TAG"
 
-step "Using existing .config (regenerating via defconfig)"
+step "Overlaying solarmatrix/ from $INVOKING_BRANCH"
+# Restore the solarmatrix/ dir onto the detached tag's tree. This gives us
+# tag's sources + our build scripts. Index will show solarmatrix/ as staged
+# but no commit happens.
+git checkout "$INVOKING_BRANCH" -- solarmatrix/
+
+step "Writing .config for OpenWRT One (mediatek/filogic)"
+cat > .config <<'EOF'
+CONFIG_TARGET_mediatek=y
+CONFIG_TARGET_mediatek_filogic=y
+CONFIG_TARGET_mediatek_filogic_DEVICE_openwrt_one=y
+EOF
 make defconfig
 
 step "Building (this is slow)"
