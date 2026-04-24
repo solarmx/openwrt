@@ -10,6 +10,10 @@
 
 set -euo pipefail
 
+LIC_TMP=""
+trap '[ -n "${LIC_TMP:-}" ] && rm -f "$LIC_TMP"' EXIT INT TERM
+
+# REPO_ROOT is overridable so tests can point the script at a synthetic tree.
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 TAG="${OPENWRT_TAG:-unknown}"
 
@@ -37,6 +41,7 @@ while IFS= read -r LINE; do
     # package names don't map 1:1 to Makefile identifiers, so we try four
     # strategies in order, first hit wins.
     MK=""
+    ABI_STRIPPED=""
 
     # Strategy 1: Package block match (subpackages like libssl from openssl).
     MK="$(grep -rlE "^define Package/${PKG}\$" "$REPO_ROOT/package" "$REPO_ROOT/feeds" 2>/dev/null | head -1 || true)"
@@ -63,6 +68,13 @@ while IFS= read -r LINE; do
                 MK="$(grep -rlE "^PKG_NAME:=${ABI_STRIPPED}\$" "$REPO_ROOT/package" "$REPO_ROOT/feeds" 2>/dev/null | head -1 || true)"
             fi
         fi
+    fi
+
+    # Makefile-declared PKG_NAME drives build_dir lookups for pkgs whose
+    # installed name was ABI-stripped or otherwise diverges from source.
+    MK_PKG_NAME=""
+    if [ -n "$MK" ]; then
+        MK_PKG_NAME="$(awk -F':=' '/^PKG_NAME:=/{print $2; exit}' "$MK" | sed 's/^ *//; s/ *$//')"
     fi
 
     LIC=""
@@ -102,21 +114,22 @@ while IFS= read -r LINE; do
     FIRST_SPDX="$(printf '%s' "$LIC" | awk '{print $1}' | tr -d '()')"
 
     # Build dirs have layout build_dir/target-<arch>/<PKG_NAME>-<version>/.
+    # Installed name may differ from the source dir (ABI-stripped, Makefile-
+    # declared). Try each candidate, first hit wins.
     BUILD_MATCH=""
-    for BD in "$REPO_ROOT"/build_dir/target-*/"$PKG-$VER" \
-              "$REPO_ROOT"/build_dir/target-*/"$PKG"-*; do
-        [ -d "$BD" ] || continue
-        BUILD_MATCH="$BD"
-        break
+    for CAND in "$PKG" "${ABI_STRIPPED:-}" "$MK_PKG_NAME"; do
+        [ -n "$CAND" ] || continue
+        for BD in "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER" \
+                  "$REPO_ROOT"/build_dir/target-*/"$CAND"-*; do
+            [ -d "$BD" ] || continue
+            BUILD_MATCH="$BD"
+            break 2
+        done
     done
-    FIRST_FILE=1
     if [ -n "$BUILD_MATCH" ]; then
         while IFS= read -r F; do
-            if [ "$FIRST_FILE" -eq 0 ]; then
-                printf '\n\n---\n\n' >> "$LIC_TMP"
-            fi
+            [ -s "$LIC_TMP" ] && printf '\n\n---\n\n' >> "$LIC_TMP"
             cat "$F" >> "$LIC_TMP"
-            FIRST_FILE=0
         done < <(find "$BUILD_MATCH" -maxdepth 2 -type f \
             \( -iname 'LICENSE*' -o -iname 'LICENCE*' \
                -o -iname 'COPYING*' -o -iname 'NOTICE*' \) \
@@ -124,19 +137,17 @@ while IFS= read -r LINE; do
     fi
 
     # Fallback: SPDX template (generic, only when no per-package LICENSE found).
-    if [ "$FIRST_FILE" -eq 1 ] && [ "$LIC" != "UNKNOWN" ]; then
+    if [ ! -s "$LIC_TMP" ] && [ "$LIC" != "UNKNOWN" ]; then
         CANDIDATE="$REPO_ROOT/LICENSES/$FIRST_SPDX"
         if [ -f "$CANDIDATE" ]; then
             cat "$CANDIDATE" >> "$LIC_TMP"
-            FIRST_FILE=0
         fi
     fi
 
     # Hard fail: licensed package with no resolvable text.
-    if [ "$FIRST_FILE" -eq 1 ] && [ "$LIC" != "UNKNOWN" ]; then
-        rm -f "$LIC_TMP"
+    if [ ! -s "$LIC_TMP" ] && [ "$LIC" != "UNKNOWN" ]; then
         echo "collect-licenses.sh: $PKG@$VER: license=$LIC but no LICENSE text found" >&2
-        echo "  searched: $REPO_ROOT/build_dir/target-*/$PKG-*/{LICENSE,LICENCE,COPYING,NOTICE}*" >&2
+        echo "  searched: $REPO_ROOT/build_dir/target-*/{$PKG,${ABI_STRIPPED:-},${MK_PKG_NAME:-}}-*/{LICENSE,LICENCE,COPYING,NOTICE}*" >&2
         echo "  searched: $REPO_ROOT/LICENSES/$FIRST_SPDX" >&2
         exit 1
     fi
@@ -149,7 +160,6 @@ while IFS= read -r LINE; do
         "$(printf '%s' "$LIC" | jq -Rs .)" \
         "$(printf '%s' "$SRC_URL" | jq -Rs .)" \
         "$(jq -Rs . < "$LIC_TMP")"
-    rm -f "$LIC_TMP"
 done < "$MANIFEST"
 
 printf '\n  ]\n}\n'
