@@ -738,5 +738,30 @@ TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="foo") | .text')
 assert_contains "LGPL-2.1 TEMPLATE TEXT" "$TEXT" "case 33: solarmatrix/licenses/spdx/ fallback"
 rm -rf "$T"
 
+# --- Case 34: final assembly survives multi-MB notice arrays ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/bin/targets/x/y" "$T/LICENSES"
+# Craft a LICENSE template large enough to push the concatenated
+# notices JSON past 128 KB argv limit. 20 packages x 100 KB = 2 MB.
+python3 -c 'print("X" * 100000)' > "$T/LICENSES/MIT"
+for i in $(seq 1 20); do
+    mkdir -p "$T/package/pkg$i"
+    cat > "$T/package/pkg$i/Makefile" <<MK
+define Package/pkg$i
+endef
+PKG_NAME:=pkg$i
+PKG_LICENSE:=MIT
+MK
+    printf 'pkg%s - 1.0\n' "$i" >> "$T/bin/targets/x/y/rootfs.manifest"
+done
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 34: RC=$RC (ARG_MAX?)"; FAIL=$((FAIL+1)); }
+# Verify 20 notices emitted, each with 100-KB text.
+COUNT=$(printf '%s' "$OUT" | jq '.notices | length')
+[ "$COUNT" = "20" ] || { echo "FAIL: case 34: got $COUNT notices, expected 20"; FAIL=$((FAIL+1)); }
+rm -rf "$T"
+
 echo "--- $CASES cases, $FAIL failures ---"
 [ "$FAIL" -eq 0 ]
