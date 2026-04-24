@@ -152,8 +152,8 @@ while IFS= read -r LINE; do
             [ -s "$LIC_TMP" ] && printf '\n\n---\n\n' >> "$LIC_TMP"
             cat "$F" >> "$LIC_TMP"
         done < <(find "$BUILD_MATCH" -maxdepth 3 -type f \
-            \( -iname 'LICENSE*' -o -iname 'LICENCE*' \
-               -o -iname 'COPYING*' -o -iname 'NOTICE*' \) \
+            \( -iname 'LICENSE*' -o -iname 'LICENCE*' -o -iname 'COPYING*' \
+               -o -iname 'NOTICE*' -o -iname 'copyright*' -o -iname 'LEGAL*' \) \
             | sort)
     fi
 
@@ -170,8 +170,10 @@ while IFS= read -r LINE; do
         SEARCHED_NAMES="$PKG"
         [ -n "${ABI_STRIPPED:-}" ] && SEARCHED_NAMES="$SEARCHED_NAMES, $ABI_STRIPPED"
         [ -n "${MK_PKG_NAME:-}" ] && [ "$MK_PKG_NAME" != "$PKG" ] && SEARCHED_NAMES="$SEARCHED_NAMES, $MK_PKG_NAME"
+        SEARCHED_VERS="$VER"
+        [ "$VER_STRIPPED" != "$VER" ] && SEARCHED_VERS="$SEARCHED_VERS, $VER_STRIPPED"
         echo "collect-licenses.sh: $PKG@$VER: license=$LIC but no LICENSE text found" >&2
-        echo "  searched: $REPO_ROOT/build_dir/target-*/{$SEARCHED_NAMES}-$VER/{LICENSE,LICENCE,COPYING,NOTICE}*" >&2
+        echo "  searched: $REPO_ROOT/build_dir/target-*/{$SEARCHED_NAMES}-{$SEARCHED_VERS}/{LICENSE,LICENCE,COPYING,NOTICE,copyright,LEGAL}*" >&2
         echo "  searched: $REPO_ROOT/LICENSES/$FIRST_SPDX" >&2
         exit 1
     fi

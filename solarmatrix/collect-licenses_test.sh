@@ -534,5 +534,67 @@ assert_contains "CA BUNDLE COPYRIGHT TEXT" "$TEXT" \
     "case 23: ca-bundle resolves via MK_PKG_NAME=ca-certificates + stripped VER"
 rm -rf "$T"
 
+# --- Case 24: Debian-style debian/copyright file is discovered ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/foo" "$T/build_dir/target-x/foo-1.0/debian" "$T/bin/targets/x/y"
+cat > "$T/package/foo/Makefile" <<'MK'
+define Package/foo
+endef
+PKG_NAME:=foo
+PKG_LICENSE:=GPL-2.0-or-later
+MK
+printf 'DEBIAN COPYRIGHT TEXT FOR FOO\n' > "$T/build_dir/target-x/foo-1.0/debian/copyright"
+printf 'foo - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 24: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="foo") | .text')
+assert_contains "DEBIAN COPYRIGHT TEXT FOR FOO" "$TEXT" \
+    "case 24: debian/copyright at depth 2 is found by find -iname copyright*"
+rm -rf "$T"
+
+# --- Case 25: LEGAL.txt-style file is discovered ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/bar" "$T/build_dir/target-x/bar-2.0" "$T/bin/targets/x/y"
+cat > "$T/package/bar/Makefile" <<'MK'
+define Package/bar
+endef
+PKG_NAME:=bar
+PKG_LICENSE:=Apache-2.0
+MK
+printf 'LEGAL NOTICE FOR BAR\n' > "$T/build_dir/target-x/bar-2.0/LEGAL.txt"
+printf 'bar - 2.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 25: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="bar") | .text')
+assert_contains "LEGAL NOTICE FOR BAR" "$TEXT" \
+    "case 25: LEGAL.txt at top level is found by find -iname LEGAL*"
+rm -rf "$T"
+
+# --- Case 26: ca-bundle scenario (F5-fix-2 + F5-fix-3 combined) ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/ca-certificates" "$T/build_dir/target-x/ca-certificates-20250419/debian" "$T/bin/targets/x/y"
+cat > "$T/package/ca-certificates/Makefile" <<'MK'
+define Package/ca-certificates
+endef
+define Package/ca-bundle
+endef
+PKG_NAME:=ca-certificates
+PKG_LICENSE:=GPL-2.0-or-later MPL-2.0
+MK
+printf 'CA CERT DEBIAN COPYRIGHT\n' > "$T/build_dir/target-x/ca-certificates-20250419/debian/copyright"
+printf 'ca-bundle - 20250419-r2\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 26: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="ca-bundle") | .text')
+assert_contains "CA CERT DEBIAN COPYRIGHT" "$TEXT" \
+    "case 26: ca-bundle full path — MK_PKG_NAME + stripped VER + debian/copyright"
+rm -rf "$T"
+
 echo "--- $CASES cases, $FAIL failures ---"
 [ "$FAIL" -eq 0 ]
