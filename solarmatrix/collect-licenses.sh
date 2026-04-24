@@ -11,7 +11,8 @@
 set -euo pipefail
 
 LIC_TMP=""
-trap '[ -n "${LIC_TMP:-}" ] && rm -f "$LIC_TMP"' EXIT INT TERM
+NOTICES_TMP=""
+trap '[ -n "${LIC_TMP:-}" ] && rm -f "$LIC_TMP"; [ -n "${NOTICES_TMP:-}" ] && rm -f "$NOTICES_TMP"' EXIT INT TERM
 
 # REPO_ROOT is overridable so tests can point the script at a synthetic tree.
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -301,15 +302,21 @@ if [ "${#BAD_LINES[@]}" -gt 0 ]; then
     exit 1
 fi
 
-# Assemble final document. Buffered notices array feeds jq -s to produce a
-# single JSON array, then combined with header fields.
+# Assemble final document. Route notices through a tempfile + --slurpfile
+# instead of --argjson because the concatenated notices JSON grows multi-MB
+# on a full build (license text for ~133 packages), exceeding Linux's
+# MAX_ARG_STRLEN (128 KB per single argv) and tripping "Argument list too
+# long". --slurpfile reads file content as JSON wrapped in an outer array
+# ([<file-contents>]); since the file itself already holds an array, the
+# bound value is [[<actual-array>]], hence $notices[0] to unwrap.
+NOTICES_TMP="$(mktemp)"
 if [ "${#NOTICES[@]}" -eq 0 ]; then
-    NOTICES_JSON='[]'
+    printf '[]\n' > "$NOTICES_TMP"
 else
-    NOTICES_JSON="$(printf '%s\n' "${NOTICES[@]}" | jq -s .)"
+    printf '%s\n' "${NOTICES[@]}" | jq -s . > "$NOTICES_TMP"
 fi
 jq -n \
-    --argjson notices "$NOTICES_JSON" \
+    --slurpfile notices "$NOTICES_TMP" \
     --arg gen_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg tag "$TAG" \
-    '{generated_at:$gen_at, openwrt_version:$tag, notices:$notices}'
+    '{generated_at:$gen_at, openwrt_version:$tag, notices:$notices[0]}'
