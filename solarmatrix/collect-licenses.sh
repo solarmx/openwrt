@@ -116,15 +116,22 @@ while IFS= read -r LINE; do
     # byte-for-byte (bash $(cat ...) strips them).
     FIRST_SPDX="$(printf '%s' "$LIC" | awk '{print $1}' | tr -d '()')"
 
-    # Build dirs have layout build_dir/target-<arch>/<PKG_NAME>-<version>/.
+    # Build dirs usually have layout build_dir/target-<arch>/<PKG_NAME>-<version>/.
     # Installed name may differ from the source dir (ABI-stripped, Makefile-
     # declared). Try each candidate, first hit wins. Match exactly on
     # "<CAND>-<VER>" — prefix wildcards silently match longer-named neighbors
     # (e.g. foo-utils-9.9 when looking for foo-1.0), causing misattribution.
+    #
+    # Bare-CAND fallback: some packages (apk-mbedtls and siblings) use a
+    # version-less outer dir named after PKG_NAME, containing a nested
+    # upstream-tarball dir (e.g. apk-mbedtls/apk-3.0.5/LICENSE). Tried only
+    # after the versioned glob misses; bare-CAND is an EXACT dir-name match
+    # (no trailing *), so `foo` does not silently match `foo-utils`.
     BUILD_MATCH=""
     for CAND in "$PKG" "${ABI_STRIPPED:-}" "$MK_PKG_NAME"; do
         [ -n "$CAND" ] || continue
-        for BD in "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER"; do
+        for BD in "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER" \
+                  "$REPO_ROOT"/build_dir/target-*/"$CAND"; do
             [ -d "$BD" ] || continue
             BUILD_MATCH="$BD"
             break 2
@@ -134,7 +141,7 @@ while IFS= read -r LINE; do
         while IFS= read -r F; do
             [ -s "$LIC_TMP" ] && printf '\n\n---\n\n' >> "$LIC_TMP"
             cat "$F" >> "$LIC_TMP"
-        done < <(find "$BUILD_MATCH" -maxdepth 2 -type f \
+        done < <(find "$BUILD_MATCH" -maxdepth 3 -type f \
             \( -iname 'LICENSE*' -o -iname 'LICENCE*' \
                -o -iname 'COPYING*' -o -iname 'NOTICE*' \) \
             | sort)

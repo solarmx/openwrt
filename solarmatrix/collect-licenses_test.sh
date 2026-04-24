@@ -414,5 +414,45 @@ else
 fi
 rm -rf "$T"
 
+# --- Case 18: apk-variant packages use version-less outer dir with nested upstream ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/apk-mbedtls" "$T/build_dir/target-x/apk-mbedtls/apk-3.0.5" "$T/bin/targets/x/y"
+cat > "$T/package/apk-mbedtls/Makefile" <<'MK'
+define Package/apk-mbedtls
+endef
+PKG_NAME:=apk-mbedtls
+PKG_LICENSE:=GPL-2.0-only
+MK
+printf 'REAL APK LICENSE TEXT\n' > "$T/build_dir/target-x/apk-mbedtls/apk-3.0.5/LICENSE"
+printf 'apk-mbedtls - 3.0.5-r2\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 18: nonzero exit $RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[]? | select(.name=="apk-mbedtls") | .text')
+assert_contains "REAL APK LICENSE TEXT" "$TEXT" \
+    "case 18: apk-mbedtls finds nested LICENSE under apk-3.0.5/"
+rm -rf "$T"
+
+# --- Case 19: bare CAND fallback still requires exact dir name match (no prefix glob) ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/foo" "$T/build_dir/target-x/foo-utils" "$T/bin/targets/x/y"
+cat > "$T/package/foo/Makefile" <<'MK'
+define Package/foo
+endef
+PKG_NAME:=foo
+PKG_LICENSE:=MIT
+MK
+printf 'NEIGHBOR CONTENT NOT FOO\n' > "$T/build_dir/target-x/foo-utils/LICENSE"
+printf 'foo - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>&1) || RC=$?
+[ $RC -ne 0 ] || { echo "FAIL: case 19: bare CAND must not match foo-utils as foo"; FAIL=$((FAIL+1)); }
+case "$OUT" in
+    *"NEIGHBOR CONTENT NOT FOO"*) echo "FAIL: case 19: emitted neighbor LICENSE"; FAIL=$((FAIL+1));;
+esac
+rm -rf "$T"
+
 echo "--- $CASES cases, $FAIL failures ---"
 [ "$FAIL" -eq 0 ]
