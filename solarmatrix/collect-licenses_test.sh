@@ -596,5 +596,90 @@ assert_contains "CA CERT DEBIAN COPYRIGHT" "$TEXT" \
     "case 26: ca-bundle full path — MK_PKG_NAME + stripped VER + debian/copyright"
 rm -rf "$T"
 
+# --- Case 27: in-tree package with no build_dir, LICENSE alongside Makefile ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/utils/fitblk" "$T/bin/targets/x/y"
+cat > "$T/package/utils/fitblk/Makefile" <<'MK'
+define Package/fitblk
+endef
+PKG_NAME:=fitblk
+PKG_LICENSE:=GPL-2.0-only
+MK
+printf 'IN-TREE FITBLK LICENSE\n' > "$T/package/utils/fitblk/LICENSE"
+printf 'fitblk - 2\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 27: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="fitblk") | .text')
+assert_contains "IN-TREE FITBLK LICENSE" "$TEXT" \
+    "case 27: in-tree Makefile-dir LICENSE is found when no build_dir exists"
+rm -rf "$T"
+
+# --- Case 28: GPL-2.0-only falls back to LICENSES/GPL-2.0 template ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/foo" "$T/LICENSES" "$T/bin/targets/x/y"
+cat > "$T/package/foo/Makefile" <<'MK'
+define Package/foo
+endef
+PKG_NAME:=foo
+PKG_LICENSE:=GPL-2.0-only
+MK
+printf 'GENERIC GPL-2.0 TEMPLATE BODY\n' > "$T/LICENSES/GPL-2.0"
+# No build_dir, no LICENSE in package dir either.
+printf 'foo - 1\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 28: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="foo") | .text')
+assert_contains "GENERIC GPL-2.0 TEMPLATE BODY" "$TEXT" \
+    "case 28: GPL-2.0-only resolves via LICENSES/GPL-2.0 (alias strip)"
+rm -rf "$T"
+
+# --- Case 29: GPL-2.0-or-later also resolves via LICENSES/GPL-2.0 ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/bar" "$T/LICENSES" "$T/bin/targets/x/y"
+cat > "$T/package/bar/Makefile" <<'MK'
+define Package/bar
+endef
+PKG_NAME:=bar
+PKG_LICENSE:=GPL-2.0-or-later
+MK
+printf 'GPL-2.0 TEMPLATE\n' > "$T/LICENSES/GPL-2.0"
+printf 'bar - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 29: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="bar") | .text')
+assert_contains "GPL-2.0 TEMPLATE" "$TEXT" \
+    "case 29: GPL-2.0-or-later resolves via LICENSES/GPL-2.0 (alias strip)"
+rm -rf "$T"
+
+# --- Case 30: if LICENSES/GPL-2.0-only exists, it wins over stripped GPL-2.0 ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/baz" "$T/LICENSES" "$T/bin/targets/x/y"
+cat > "$T/package/baz/Makefile" <<'MK'
+define Package/baz
+endef
+PKG_NAME:=baz
+PKG_LICENSE:=GPL-2.0-only
+MK
+printf 'EXACT-MATCH GPL-2.0-only TEMPLATE\n' > "$T/LICENSES/GPL-2.0-only"
+printf 'WRONG STRIPPED TEMPLATE\n' > "$T/LICENSES/GPL-2.0"
+printf 'baz - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 30: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="baz") | .text')
+assert_contains "EXACT-MATCH GPL-2.0-only TEMPLATE" "$TEXT" \
+    "case 30: exact GPL-2.0-only template wins over stripped fallback"
+case "$TEXT" in
+    *"WRONG STRIPPED TEMPLATE"*) echo "FAIL: case 30: stripped template leaked"; FAIL=$((FAIL+1));;
+esac
+rm -rf "$T"
+
 echo "--- $CASES cases, $FAIL failures ---"
 [ "$FAIL" -eq 0 ]

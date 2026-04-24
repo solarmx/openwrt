@@ -147,6 +147,18 @@ while IFS= read -r LINE; do
             break 2
         done
     done
+
+    # Makefile-parent-dir fallback: in-tree utilities (e.g. fitblk) are simple
+    # enough that OpenWRT never stages them under build_dir/target-*/. When no
+    # build_dir match exists but we did resolve a Makefile, look for LICENSE-
+    # like files alongside the Makefile itself.
+    if [ -z "$BUILD_MATCH" ] && [ -n "$MK" ]; then
+        MK_DIR="$(dirname "$MK")"
+        if [ -d "$MK_DIR" ]; then
+            BUILD_MATCH="$MK_DIR"
+        fi
+    fi
+
     if [ -n "$BUILD_MATCH" ]; then
         while IFS= read -r F; do
             [ -s "$LIC_TMP" ] && printf '\n\n---\n\n' >> "$LIC_TMP"
@@ -158,11 +170,21 @@ while IFS= read -r LINE; do
     fi
 
     # Fallback: SPDX template (generic, only when no per-package LICENSE found).
+    # Try the exact SPDX id first, then strip -only / -or-later suffixes.
+    # OpenWRT's LICENSES/ dir ships base names (e.g. GPL-2.0) while modern
+    # Makefiles declare the disambiguated SPDX form (GPL-2.0-only,
+    # GPL-2.0-or-later). OpenWRT's own top-level COPYING treats these as
+    # aliases of the base license, so stripping matches upstream intent.
+    # Parameter expansion "${VAR%-suffix}" is a no-op when the suffix is
+    # absent (MIT stays MIT), so the loop is safe for any SPDX id.
     if [ ! -s "$LIC_TMP" ] && [ "$LIC" != "UNKNOWN" ]; then
-        CANDIDATE="$REPO_ROOT/LICENSES/$FIRST_SPDX"
-        if [ -f "$CANDIDATE" ]; then
-            cat "$CANDIDATE" >> "$LIC_TMP"
-        fi
+        for SPDX_TRY in "$FIRST_SPDX" "${FIRST_SPDX%-only}" "${FIRST_SPDX%-or-later}"; do
+            CANDIDATE="$REPO_ROOT/LICENSES/$SPDX_TRY"
+            if [ -f "$CANDIDATE" ]; then
+                cat "$CANDIDATE" >> "$LIC_TMP"
+                break
+            fi
+        done
     fi
 
     # Hard fail: licensed package with no resolvable text.
