@@ -25,16 +25,15 @@ if [ -z "$MANIFEST" ] || [ ! -f "$MANIFEST" ]; then
     exit 1
 fi
 
-printf '{\n'
-printf '  "generated_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-printf '  "openwrt_version": "%s",\n' "$TAG"
-printf '  "notices": [\n'
-
 # Single tempfile reused across all iterations — avoids leaking N-1 tempfiles
 # per run. Trap at top of script handles cleanup on exit.
 LIC_TMP="$(mktemp)"
 
-FIRST=1
+# Buffer notices as per-entry JSON strings so post-passes (ucode-mod-*
+# inheritance, vendor-firmware override injection) can rewrite entries
+# before we emit the final document.
+NOTICES=()
+
 while IFS= read -r LINE; do
     # Manifest line: "pkgname - pkgversion"
     PKG="$(printf '%s' "$LINE" | awk -F ' - ' '{print $1}')"
@@ -160,14 +159,25 @@ while IFS= read -r LINE; do
         exit 1
     fi
 
-    [ "$FIRST" -eq 0 ] && printf ',\n'
-    FIRST=0
-    printf '    {"source":"openwrt","name":%s,"version":%s,"license":%s,"source_url":%s,"text":%s}' \
-        "$(printf '%s' "$PKG" | jq -Rs .)" \
-        "$(printf '%s' "$VER" | jq -Rs .)" \
-        "$(printf '%s' "$LIC" | jq -Rs .)" \
-        "$(printf '%s' "$SRC_URL" | jq -Rs .)" \
-        "$(jq -Rs . < "$LIC_TMP")"
+    ENTRY="$(jq -cn \
+        --arg pkg "$PKG" \
+        --arg ver "$VER" \
+        --arg lic "$LIC" \
+        --arg src "$SRC_URL" \
+        --rawfile text "$LIC_TMP" \
+        '{source:"openwrt", name:$pkg, version:$ver, license:$lic, source_url:$src, text:$text}')"
+    NOTICES+=("$ENTRY")
 done < "$MANIFEST"
 
-printf '\n  ]\n}\n'
+# Assemble final document. Buffered notices array feeds jq -s to produce a
+# single JSON array, then combined with header fields.
+if [ "${#NOTICES[@]}" -eq 0 ]; then
+    NOTICES_JSON='[]'
+else
+    NOTICES_JSON="$(printf '%s\n' "${NOTICES[@]}" | jq -s .)"
+fi
+jq -n \
+    --argjson notices "$NOTICES_JSON" \
+    --arg gen_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg tag "$TAG" \
+    '{generated_at:$gen_at, openwrt_version:$tag, notices:$notices}'
