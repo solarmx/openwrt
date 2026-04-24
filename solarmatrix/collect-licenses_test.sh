@@ -160,7 +160,9 @@ MK
 printf 'MIT template body\n' > "$T/LICENSES/MIT"
 printf 'REAL JANSSON COPYRIGHT 2009 P.L.\n' > "$T/build_dir/target-x/jansson-2.14/LICENSE"
 printf 'jansson4 - 2.14\n' > "$T/bin/targets/x/y/rootfs.manifest"
-OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null)
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 6: nonzero exit $RC"; FAIL=$((FAIL+1)); }
 TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="jansson4") | .text')
 assert_contains "REAL JANSSON COPYRIGHT 2009 P.L." "$TEXT" \
     "case 6: ABI-stripped jansson4 picks real LICENSE from jansson-2.14/, not SPDX template"
@@ -189,6 +191,32 @@ OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>&1) || RC=$?
 [ $RC -ne 0 ] || { echo "FAIL: case 7: zero-byte LICENSE should hard-fail"; FAIL=$((FAIL+1)); }
 assert_contains "foo@1.0: license=MIT but no LICENSE text found" "$OUT" \
     "case 7: stderr names pkg + license"
+rm -rf "$T"
+
+# --- Case 8: prefix glob must NOT match longer-named neighbor package ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/foo" "$T/build_dir/target-x/foo-utils-9.9" \
+         "$T/bin/targets/x/y"
+cat > "$T/package/foo/Makefile" <<'MK'
+define Package/foo
+endef
+PKG_NAME:=foo
+PKG_LICENSE:=MIT
+MK
+printf 'WRONG_PACKAGE_FOO_UTILS_LICENSE\n' > "$T/build_dir/target-x/foo-utils-9.9/LICENSE"
+printf 'foo - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>&1) || RC=$?
+[ $RC -ne 0 ] || { echo "FAIL: case 8: expected hard-fail, got RC=0"; FAIL=$((FAIL+1)); }
+case "$OUT" in
+    *"WRONG_PACKAGE_FOO_UTILS_LICENSE"*)
+        echo "FAIL: case 8: emitted neighbor package's LICENSE (misattribution)"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+assert_contains "foo@1.0: license=MIT but no LICENSE text found" "$OUT" \
+    "case 8: stderr names pkg + license on hard-fail"
 rm -rf "$T"
 
 echo "--- $CASES cases, $FAIL failures ---"

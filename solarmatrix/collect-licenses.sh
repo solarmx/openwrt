@@ -30,12 +30,17 @@ printf '  "generated_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf '  "openwrt_version": "%s",\n' "$TAG"
 printf '  "notices": [\n'
 
+# Single tempfile reused across all iterations — avoids leaking N-1 tempfiles
+# per run. Trap at top of script handles cleanup on exit.
+LIC_TMP="$(mktemp)"
+
 FIRST=1
 while IFS= read -r LINE; do
     # Manifest line: "pkgname - pkgversion"
     PKG="$(printf '%s' "$LINE" | awk -F ' - ' '{print $1}')"
     VER="$(printf '%s' "$LINE" | awk -F ' - ' '{print $2}')"
     [ -z "$PKG" ] && continue
+    : > "$LIC_TMP"
 
     # Resolve the Makefile defining this installed package. OpenWRT's installed
     # package names don't map 1:1 to Makefile identifiers, so we try four
@@ -74,7 +79,7 @@ while IFS= read -r LINE; do
     # installed name was ABI-stripped or otherwise diverges from source.
     MK_PKG_NAME=""
     if [ -n "$MK" ]; then
-        MK_PKG_NAME="$(awk -F':=' '/^PKG_NAME:=/{print $2; exit}' "$MK" | sed 's/^ *//; s/ *$//')"
+        MK_PKG_NAME="$(awk -F':=' '/^PKG_NAME[[:space:]]*:=/{print $2; exit}' "$MK" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     fi
 
     LIC=""
@@ -110,17 +115,17 @@ while IFS= read -r LINE; do
     # Hard fail when $LIC != UNKNOWN and neither source yields text.
     # Accumulate bytes into a temp file so trailing newlines are preserved
     # byte-for-byte (bash $(cat ...) strips them).
-    LIC_TMP="$(mktemp)"
     FIRST_SPDX="$(printf '%s' "$LIC" | awk '{print $1}' | tr -d '()')"
 
     # Build dirs have layout build_dir/target-<arch>/<PKG_NAME>-<version>/.
     # Installed name may differ from the source dir (ABI-stripped, Makefile-
-    # declared). Try each candidate, first hit wins.
+    # declared). Try each candidate, first hit wins. Match exactly on
+    # "<CAND>-<VER>" — prefix wildcards silently match longer-named neighbors
+    # (e.g. foo-utils-9.9 when looking for foo-1.0), causing misattribution.
     BUILD_MATCH=""
     for CAND in "$PKG" "${ABI_STRIPPED:-}" "$MK_PKG_NAME"; do
         [ -n "$CAND" ] || continue
-        for BD in "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER" \
-                  "$REPO_ROOT"/build_dir/target-*/"$CAND"-*; do
+        for BD in "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER"; do
             [ -d "$BD" ] || continue
             BUILD_MATCH="$BD"
             break 2
@@ -146,8 +151,11 @@ while IFS= read -r LINE; do
 
     # Hard fail: licensed package with no resolvable text.
     if [ ! -s "$LIC_TMP" ] && [ "$LIC" != "UNKNOWN" ]; then
+        SEARCHED_NAMES="$PKG"
+        [ -n "${ABI_STRIPPED:-}" ] && SEARCHED_NAMES="$SEARCHED_NAMES, $ABI_STRIPPED"
+        [ -n "${MK_PKG_NAME:-}" ] && [ "$MK_PKG_NAME" != "$PKG" ] && SEARCHED_NAMES="$SEARCHED_NAMES, $MK_PKG_NAME"
         echo "collect-licenses.sh: $PKG@$VER: license=$LIC but no LICENSE text found" >&2
-        echo "  searched: $REPO_ROOT/build_dir/target-*/{$PKG,${ABI_STRIPPED:-},${MK_PKG_NAME:-}}-*/{LICENSE,LICENCE,COPYING,NOTICE}*" >&2
+        echo "  searched: $REPO_ROOT/build_dir/target-*/{$SEARCHED_NAMES}-$VER/{LICENSE,LICENCE,COPYING,NOTICE}*" >&2
         echo "  searched: $REPO_ROOT/LICENSES/$FIRST_SPDX" >&2
         exit 1
     fi
