@@ -1,0 +1,10 @@
+Source: linux-firmware.git LICENCE.inside-secure (commit 2aaf3bf0702cb63656379c434a1cf90737f31e49)
+URL: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/LICENCE.inside-secure
+Retrieved: 2026-04-24
+
+Copyright (c) 2019 Verimatrix, Inc.
+
+Derived from proprietary unpublished source code.
+Permission is hereby granted for the distribution of this firmware
+as part of Linux or other Open Source operating system kernel,
+provided this copyright notice is accompanying it.
