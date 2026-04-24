@@ -169,6 +169,37 @@ while IFS= read -r LINE; do
     NOTICES+=("$ENTRY")
 done < "$MANIFEST"
 
+# ucode-mod-* inheritance: upstream OpenWRT omits PKG_LICENSE on these
+# subpackages even though they build from the same tree as `ucode` (ISC).
+# Inherit license=ISC and text from the parent `ucode` notice. Hard fail
+# if parent is missing or its text is empty — shipping an unattributed
+# subpackage is worse than failing the build.
+UCODE_TEXT=""
+for ENTRY in "${NOTICES[@]}"; do
+    NAME=$(printf '%s' "$ENTRY" | jq -r .name)
+    if [ "$NAME" = "ucode" ]; then
+        UCODE_TEXT=$(printf '%s' "$ENTRY" | jq -r .text)
+        break
+    fi
+done
+
+NEW_NOTICES=()
+for ENTRY in "${NOTICES[@]}"; do
+    NAME=$(printf '%s' "$ENTRY" | jq -r .name)
+    case "$NAME" in
+        ucode-mod-*)
+            if [ -z "$UCODE_TEXT" ]; then
+                echo "collect-licenses.sh: $NAME: parent 'ucode' missing or has empty text" >&2
+                exit 1
+            fi
+            ENTRY=$(printf '%s' "$ENTRY" | jq --arg t "$UCODE_TEXT" \
+                '.license="ISC" | .text=$t')
+            ;;
+    esac
+    NEW_NOTICES+=("$ENTRY")
+done
+NOTICES=("${NEW_NOTICES[@]}")
+
 # Assemble final document. Buffered notices array feeds jq -s to produce a
 # single JSON array, then combined with header fields.
 if [ "${#NOTICES[@]}" -eq 0 ]; then
