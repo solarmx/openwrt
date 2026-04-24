@@ -681,5 +681,62 @@ case "$TEXT" in
 esac
 rm -rf "$T"
 
+# --- Case 31: kmod-* package resolves via build_dir/target-*/linux-*/<mk_pkg_name>-<stripped_ver>/ ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/kernel/mt76" "$T/build_dir/target-x/linux-y/mt76-20250101~abc" "$T/bin/targets/x/y"
+cat > "$T/package/kernel/mt76/Makefile" <<'MK'
+define KernelPackage/mt76-connac
+endef
+PKG_NAME:=mt76
+PKG_LICENSE:=BSD-3-Clause-Clear
+MK
+printf 'MT76 LICENSE BODY\n' > "$T/build_dir/target-x/linux-y/mt76-20250101~abc/LICENSE"
+printf 'kmod-mt76-connac - 20250101~abc-r1\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 31: RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="kmod-mt76-connac") | .text')
+assert_contains "MT76 LICENSE BODY" "$TEXT" "case 31: kmod via linux-*/mt76-<ver>"
+rm -rf "$T"
+
+# --- Case 32: '+' suffix is old-form SPDX alias for '-or-later' ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/mtd" "$T/LICENSES" "$T/bin/targets/x/y"
+cat > "$T/package/mtd/Makefile" <<'MK'
+define Package/mtd
+endef
+PKG_NAME:=mtd
+PKG_LICENSE:=GPL-2.0+
+MK
+printf 'GPL-2.0 TEMPLATE\n' > "$T/LICENSES/GPL-2.0"
+printf 'mtd - 27\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 32: RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="mtd") | .text')
+assert_contains "GPL-2.0 TEMPLATE" "$TEXT" "case 32: GPL-2.0+ strips + to match LICENSES/GPL-2.0"
+rm -rf "$T"
+
+# --- Case 33: solarmatrix/licenses/spdx/ fallback for templates not in LICENSES/ ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/foo" "$T/solarmatrix/licenses/spdx" "$T/bin/targets/x/y"
+cat > "$T/package/foo/Makefile" <<'MK'
+define Package/foo
+endef
+PKG_NAME:=foo
+PKG_LICENSE:=LGPL-2.1
+MK
+printf 'LGPL-2.1 TEMPLATE TEXT\n' > "$T/solarmatrix/licenses/spdx/LGPL-2.1"
+printf 'foo - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 33: RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="foo") | .text')
+assert_contains "LGPL-2.1 TEMPLATE TEXT" "$TEXT" "case 33: solarmatrix/licenses/spdx/ fallback"
+rm -rf "$T"
+
 echo "--- $CASES cases, $FAIL failures ---"
 [ "$FAIL" -eq 0 ]

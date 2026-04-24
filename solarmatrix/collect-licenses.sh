@@ -136,12 +136,17 @@ while IFS= read -r LINE; do
         VER_STRIPPED="$VER"
     fi
 
+    # Kernel modules nest one level deeper under build_dir/target-*/linux-<subtarget>/,
+    # so we also probe the linux-*/ prefixed layout for every candidate name.
     BUILD_MATCH=""
     for CAND in "$PKG" "${ABI_STRIPPED:-}" "$MK_PKG_NAME"; do
         [ -n "$CAND" ] || continue
         for BD in "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER" \
                   "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER_STRIPPED" \
-                  "$REPO_ROOT"/build_dir/target-*/"$CAND"; do
+                  "$REPO_ROOT"/build_dir/target-*/"$CAND" \
+                  "$REPO_ROOT"/build_dir/target-*/linux-*/"$CAND-$VER" \
+                  "$REPO_ROOT"/build_dir/target-*/linux-*/"$CAND-$VER_STRIPPED" \
+                  "$REPO_ROOT"/build_dir/target-*/linux-*/"$CAND"; do
             [ -d "$BD" ] || continue
             BUILD_MATCH="$BD"
             break 2
@@ -170,20 +175,23 @@ while IFS= read -r LINE; do
     fi
 
     # Fallback: SPDX template (generic, only when no per-package LICENSE found).
-    # Try the exact SPDX id first, then strip -only / -or-later suffixes.
-    # OpenWRT's LICENSES/ dir ships base names (e.g. GPL-2.0) while modern
-    # Makefiles declare the disambiguated SPDX form (GPL-2.0-only,
-    # GPL-2.0-or-later). OpenWRT's own top-level COPYING treats these as
-    # aliases of the base license, so stripping matches upstream intent.
-    # Parameter expansion "${VAR%-suffix}" is a no-op when the suffix is
-    # absent (MIT stays MIT), so the loop is safe for any SPDX id.
+    # Try the exact SPDX id first, then strip -only / -or-later / old-form '+'
+    # suffixes. OpenWRT's LICENSES/ dir ships base names (e.g. GPL-2.0) while
+    # modern Makefiles declare the disambiguated SPDX form (GPL-2.0-only,
+    # GPL-2.0-or-later, and old-form GPL-2.0+). Stripping matches upstream
+    # intent; solarmatrix/licenses/spdx/ ships canonical texts for SPDX ids
+    # that OpenWRT's own LICENSES/ dir doesn't cover (e.g. BSD-3-Clause-Clear).
+    # Parameter expansion "${VAR%suffix}" is a no-op when the suffix is absent,
+    # so the loop is safe for any SPDX id.
     if [ ! -s "$LIC_TMP" ] && [ "$LIC" != "UNKNOWN" ]; then
-        for SPDX_TRY in "$FIRST_SPDX" "${FIRST_SPDX%-only}" "${FIRST_SPDX%-or-later}"; do
-            CANDIDATE="$REPO_ROOT/LICENSES/$SPDX_TRY"
-            if [ -f "$CANDIDATE" ]; then
-                cat "$CANDIDATE" >> "$LIC_TMP"
-                break
-            fi
+        for SPDX_TRY in "$FIRST_SPDX" "${FIRST_SPDX%-only}" "${FIRST_SPDX%-or-later}" "${FIRST_SPDX%+}"; do
+            for PREFIX in "$REPO_ROOT/LICENSES" "$REPO_ROOT/solarmatrix/licenses/spdx"; do
+                CANDIDATE="$PREFIX/$SPDX_TRY"
+                if [ -f "$CANDIDATE" ]; then
+                    cat "$CANDIDATE" >> "$LIC_TMP"
+                    break 2
+                fi
+            done
         done
     fi
 
