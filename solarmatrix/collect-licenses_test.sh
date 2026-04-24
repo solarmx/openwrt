@@ -454,5 +454,85 @@ case "$OUT" in
 esac
 rm -rf "$T"
 
+# --- Case 20: manifest has -rN suffix but build_dir uses PKG_VERSION only ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/dropbear" "$T/build_dir/target-x/dropbear-2025.89" "$T/bin/targets/x/y"
+cat > "$T/package/dropbear/Makefile" <<'MK'
+define Package/dropbear
+endef
+PKG_NAME:=dropbear
+PKG_LICENSE:=MIT
+MK
+printf 'REAL DROPBEAR LICENSE\n' > "$T/build_dir/target-x/dropbear-2025.89/LICENSE"
+printf 'dropbear - 2025.89-r1\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) && RC=0 || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 20: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="dropbear") | .text')
+assert_contains "REAL DROPBEAR LICENSE" "$TEXT" \
+    "case 20: -rN stripped version matched build_dir dropbear-2025.89"
+rm -rf "$T"
+
+# --- Case 21: multi-digit release suffix also stripped ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/foo" "$T/build_dir/target-x/foo-1.0" "$T/bin/targets/x/y"
+cat > "$T/package/foo/Makefile" <<'MK'
+define Package/foo
+endef
+PKG_NAME:=foo
+PKG_LICENSE:=MIT
+MK
+printf 'REAL FOO\n' > "$T/build_dir/target-x/foo-1.0/LICENSE"
+printf 'foo - 1.0-r12\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) && RC=0 || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 21: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="foo") | .text')
+assert_contains "REAL FOO" "$TEXT" "case 21: -r12 stripped to match foo-1.0"
+rm -rf "$T"
+
+# --- Case 22: VER with no -rN suffix: VER_STRIPPED equals VER, behavior unchanged ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/bar" "$T/build_dir/target-x/bar-2.0" "$T/bin/targets/x/y"
+cat > "$T/package/bar/Makefile" <<'MK'
+define Package/bar
+endef
+PKG_NAME:=bar
+PKG_LICENSE:=MIT
+MK
+printf 'REAL BAR\n' > "$T/build_dir/target-x/bar-2.0/LICENSE"
+printf 'bar - 2.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) && RC=0 || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 22: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="bar") | .text')
+assert_contains "REAL BAR" "$TEXT" "case 22: no -rN, still works"
+rm -rf "$T"
+
+# --- Case 23: subpackage ca-bundle finds parent ca-certificates via MK_PKG_NAME + stripped VER ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/ca-certificates" "$T/build_dir/target-x/ca-certificates-20250419" "$T/bin/targets/x/y"
+cat > "$T/package/ca-certificates/Makefile" <<'MK'
+define Package/ca-certificates
+endef
+define Package/ca-bundle
+endef
+PKG_NAME:=ca-certificates
+PKG_LICENSE:=GPL-2.0-or-later MPL-2.0
+MK
+printf 'CA BUNDLE COPYRIGHT TEXT\n' > "$T/build_dir/target-x/ca-certificates-20250419/LICENSE"
+printf 'ca-bundle - 20250419-r2\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) && RC=0 || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 23: unexpected RC=$RC"; FAIL=$((FAIL+1)); }
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="ca-bundle") | .text')
+assert_contains "CA BUNDLE COPYRIGHT TEXT" "$TEXT" \
+    "case 23: ca-bundle resolves via MK_PKG_NAME=ca-certificates + stripped VER"
+rm -rf "$T"
+
 echo "--- $CASES cases, $FAIL failures ---"
 [ "$FAIL" -eq 0 ]

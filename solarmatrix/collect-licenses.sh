@@ -127,10 +127,20 @@ while IFS= read -r LINE; do
     # upstream-tarball dir (e.g. apk-mbedtls/apk-3.0.5/LICENSE). Tried only
     # after the versioned glob misses; bare-CAND is an EXACT dir-name match
     # (no trailing *), so `foo` does not silently match `foo-utils`.
+    # OpenWRT manifests emit "<PKG_VERSION>-r<PKG_RELEASE>" but build_dir
+    # paths use only PKG_VERSION. Strip trailing "-r<digits>" so the
+    # versioned glob matches the real on-disk dir.
+    if [[ "$VER" =~ ^(.*)-r[0-9]+$ ]]; then
+        VER_STRIPPED="${BASH_REMATCH[1]}"
+    else
+        VER_STRIPPED="$VER"
+    fi
+
     BUILD_MATCH=""
     for CAND in "$PKG" "${ABI_STRIPPED:-}" "$MK_PKG_NAME"; do
         [ -n "$CAND" ] || continue
         for BD in "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER" \
+                  "$REPO_ROOT"/build_dir/target-*/"$CAND-$VER_STRIPPED" \
                   "$REPO_ROOT"/build_dir/target-*/"$CAND"; do
             [ -d "$BD" ] || continue
             BUILD_MATCH="$BD"
