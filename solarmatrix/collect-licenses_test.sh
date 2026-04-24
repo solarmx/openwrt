@@ -219,5 +219,112 @@ assert_contains "foo@1.0: license=MIT but no LICENSE text found" "$OUT" \
     "case 8: stderr names pkg + license on hard-fail"
 rm -rf "$T"
 
+# --- Case 9: ucode-mod-fs inherits ISC + text from ucode parent ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/ucode" "$T/build_dir/target-x/ucode-2026.01" "$T/bin/targets/x/y"
+cat > "$T/package/ucode/Makefile" <<'MK'
+define Package/ucode
+endef
+PKG_NAME:=ucode
+PKG_LICENSE:=ISC
+MK
+cat > "$T/build_dir/target-x/ucode-2026.01/LICENSE" <<'LIC'
+ISC License — Copyright (c) 2020+ jow@
+Permission to use, copy, modify, ...
+LIC
+# Subpackage ucode-mod-fs has no Makefile entry (simulates upstream gap).
+printf 'ucode - 2026.01\nucode-mod-fs - 2026.01\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 9: nonzero exit $RC"; FAIL=$((FAIL + 1)); }
+MOD_LIC=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="ucode-mod-fs") | .license')
+MOD_TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="ucode-mod-fs") | .text')
+PARENT_TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="ucode") | .text')
+assert_eq "ISC" "$MOD_LIC" "case 9: ucode-mod-fs license=ISC inherited"
+assert_eq "$PARENT_TEXT" "$MOD_TEXT" \
+    "case 9: ucode-mod-fs text byte-identical to ucode parent"
+assert_contains "ISC License — Copyright (c) 2020+ jow@" "$MOD_TEXT" \
+    "case 9: inherited text is the real parent LICENSE bytes"
+rm -rf "$T"
+
+# --- Case 10: multiple ucode-mod-* subpackages all inherit ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/ucode" "$T/build_dir/target-x/ucode-2026.01" "$T/bin/targets/x/y"
+cat > "$T/package/ucode/Makefile" <<'MK'
+define Package/ucode
+endef
+PKG_NAME:=ucode
+PKG_LICENSE:=ISC
+MK
+printf 'UCODE PARENT LICENSE BYTES\n' > "$T/build_dir/target-x/ucode-2026.01/LICENSE"
+printf 'ucode - 2026.01\nucode-mod-fs - 2026.01\nucode-mod-uloop - 2026.01\nucode-mod-uci - 2026.01\n' \
+    > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 10: nonzero exit $RC"; FAIL=$((FAIL + 1)); }
+for SUB in ucode-mod-fs ucode-mod-uloop ucode-mod-uci; do
+    SUB_LIC=$(printf '%s' "$OUT" | jq -r --arg n "$SUB" '.notices[] | select(.name==$n) | .license')
+    SUB_TEXT=$(printf '%s' "$OUT" | jq -r --arg n "$SUB" '.notices[] | select(.name==$n) | .text')
+    assert_eq "ISC" "$SUB_LIC" "case 10: $SUB license=ISC inherited"
+    assert_contains "UCODE PARENT LICENSE BYTES" "$SUB_TEXT" \
+        "case 10: $SUB text inherited from ucode parent"
+done
+rm -rf "$T"
+
+# --- Case 11: ucode-mod-fs without ucode parent = hard fail ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/bin/targets/x/y"
+# Manifest has ucode-mod-fs but no ucode parent entry.
+printf 'ucode-mod-fs - 2026.01\n' > "$T/bin/targets/x/y/rootfs.manifest"
+if OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>&1); then
+    echo "FAIL: case 11: expected nonzero exit, got 0"
+    FAIL=$((FAIL + 1))
+else
+    assert_contains "ucode-mod-fs: parent 'ucode' missing or has empty text" "$OUT" \
+        "case 11: stderr names failing subpackage + missing parent"
+fi
+rm -rf "$T"
+
+# --- Case 12: non-matching names ("ucodebro") untouched by inheritance rule ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/ucode" "$T/build_dir/target-x/ucode-2026.01" \
+         "$T/package/ucodebro" "$T/build_dir/target-x/ucodebro-1.0" \
+         "$T/bin/targets/x/y"
+cat > "$T/package/ucode/Makefile" <<'MK'
+define Package/ucode
+endef
+PKG_NAME:=ucode
+PKG_LICENSE:=ISC
+MK
+printf 'UCODE PARENT LICENSE\n' > "$T/build_dir/target-x/ucode-2026.01/LICENSE"
+cat > "$T/package/ucodebro/Makefile" <<'MK'
+define Package/ucodebro
+endef
+PKG_NAME:=ucodebro
+PKG_LICENSE:=Apache-2.0
+MK
+printf 'UCODEBRO OWN LICENSE BYTES\n' > "$T/build_dir/target-x/ucodebro-1.0/LICENSE"
+printf 'ucode - 2026.01\nucodebro - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 12: nonzero exit $RC"; FAIL=$((FAIL + 1)); }
+BRO_LIC=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="ucodebro") | .license')
+BRO_TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="ucodebro") | .text')
+assert_eq "Apache-2.0" "$BRO_LIC" \
+    "case 12: ucodebro keeps own license (name doesn't match ucode-mod-* pattern)"
+assert_contains "UCODEBRO OWN LICENSE BYTES" "$BRO_TEXT" \
+    "case 12: ucodebro keeps own LICENSE text"
+case "$BRO_TEXT" in
+    *"UCODE PARENT LICENSE"*)
+        echo "FAIL: case 12: ucodebro inherited from ucode (should not have)"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+rm -rf "$T"
+
 echo "--- $CASES cases, $FAIL failures ---"
 [ "$FAIL" -eq 0 ]
