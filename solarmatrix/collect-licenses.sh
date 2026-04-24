@@ -4,11 +4,13 @@
 # Emits a JSON document listing every package installed in the built rootfs.
 # Reads the build's manifest + each package's source Makefile. Packages
 # without a PKG_LICENSE are reported as UNKNOWN. License text is resolved
-# from the upstream LICENSES/ dir by SPDX ID when available.
+# per package from its build dir (LICENSE/LICENCE/COPYING/NOTICE files),
+# falling back to the upstream LICENSES/<SPDX> template when no per-package
+# text exists. Hard fails on licensed packages with no resolvable text.
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 TAG="${OPENWRT_TAG:-unknown}"
 
 # Find the manifest produced by the build.
@@ -89,14 +91,54 @@ while IFS= read -r LINE; do
         LIC="GPL-2.0-only"
     fi
 
-    # Resolve license text from LICENSES/<SPDX> when available.
-    LIC_TEXT=""
-    if [ "$LIC" != "UNKNOWN" ]; then
-        FIRST_SPDX="$(printf '%s' "$LIC" | awk '{print $1}' | tr -d '()')"
+    # Resolve license text. Preference order:
+    #   1. Real per-package LICENSE/LICENCE/COPYING/NOTICE in the package
+    #      build dir (preserves original copyright).
+    #   2. SPDX template from $REPO_ROOT/LICENSES/<SPDX> (generic, last resort).
+    # Hard fail when $LIC != UNKNOWN and neither source yields text.
+    # Accumulate bytes into a temp file so trailing newlines are preserved
+    # byte-for-byte (bash $(cat ...) strips them).
+    LIC_TMP="$(mktemp)"
+    FIRST_SPDX="$(printf '%s' "$LIC" | awk '{print $1}' | tr -d '()')"
+
+    # Build dirs have layout build_dir/target-<arch>/<PKG_NAME>-<version>/.
+    BUILD_MATCH=""
+    for BD in "$REPO_ROOT"/build_dir/target-*/"$PKG-$VER" \
+              "$REPO_ROOT"/build_dir/target-*/"$PKG"-*; do
+        [ -d "$BD" ] || continue
+        BUILD_MATCH="$BD"
+        break
+    done
+    FIRST_FILE=1
+    if [ -n "$BUILD_MATCH" ]; then
+        while IFS= read -r F; do
+            if [ "$FIRST_FILE" -eq 0 ]; then
+                printf '\n\n---\n\n' >> "$LIC_TMP"
+            fi
+            cat "$F" >> "$LIC_TMP"
+            FIRST_FILE=0
+        done < <(find "$BUILD_MATCH" -maxdepth 2 -type f \
+            \( -iname 'LICENSE*' -o -iname 'LICENCE*' \
+               -o -iname 'COPYING*' -o -iname 'NOTICE*' \) \
+            | sort)
+    fi
+
+    # Fallback: SPDX template (generic, only when no per-package LICENSE found).
+    if [ "$FIRST_FILE" -eq 1 ] && [ "$LIC" != "UNKNOWN" ]; then
         CANDIDATE="$REPO_ROOT/LICENSES/$FIRST_SPDX"
         if [ -f "$CANDIDATE" ]; then
-            LIC_TEXT="$(cat "$CANDIDATE")"
+            cat "$CANDIDATE" >> "$LIC_TMP"
+            FIRST_FILE=0
         fi
+    fi
+
+    # Hard fail: licensed package with no resolvable text.
+    if [ "$FIRST_FILE" -eq 1 ] && [ "$LIC" != "UNKNOWN" ]; then
+        rm -f "$LIC_TMP"
+        echo "collect-licenses.sh: $PKG@$VER: license=$LIC but no LICENSE text found" >&2
+        echo "  searched: $REPO_ROOT/build_dir/target-*/$PKG-*/{LICENSE,LICENCE,COPYING,NOTICE}*" >&2
+        echo "  searched: $REPO_ROOT/LICENSES/$FIRST_SPDX" >&2
+        exit 1
     fi
 
     [ "$FIRST" -eq 0 ] && printf ',\n'
@@ -106,7 +148,8 @@ while IFS= read -r LINE; do
         "$(printf '%s' "$VER" | jq -Rs .)" \
         "$(printf '%s' "$LIC" | jq -Rs .)" \
         "$(printf '%s' "$SRC_URL" | jq -Rs .)" \
-        "$(printf '%s' "$LIC_TEXT" | jq -Rs .)"
+        "$(jq -Rs . < "$LIC_TMP")"
+    rm -f "$LIC_TMP"
 done < "$MANIFEST"
 
 printf '\n  ]\n}\n'
