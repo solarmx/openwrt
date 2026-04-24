@@ -131,20 +131,8 @@ assert_contains 'Version 2, June 1991 (generic SPDX template body)' "$TEXT" \
     "case 4: SPDX template body present"
 rm -rf "$T"
 
-# --- Case 5: license=UNKNOWN + empty text still allowed at F1 stage ---
-CASES=$((CASES + 1))
-T=$(mktemp -d)
-mkdir -p "$T/bin/targets/x/y"
-# No package/Makefile entry, no LICENSE file -> license=UNKNOWN, text="".
-printf 'mystery - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
-RC=0
-OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
-[ $RC -eq 0 ] || { echo "FAIL: case 5: nonzero exit $RC"; FAIL=$((FAIL + 1)); }
-LICVAL=$(printf '%s' "$OUT" | jq -r '.notices[]? | select(.name=="mystery") | .license')
-TEXT=$(printf '%s' "$OUT" | jq -r '.notices[]? | select(.name=="mystery") | .text')
-assert_eq 'UNKNOWN' "$LICVAL" "case 5: UNKNOWN license preserved"
-assert_eq '' "$TEXT" "case 5: empty text preserved (gate lands in F3)"
-rm -rf "$T"
+# --- Case 5: [retired at F3] license=UNKNOWN + empty text is now a hard-fail.
+# Coverage moved to case 14 (same setup, asserts nonzero exit + stderr content).
 
 # --- Case 6: ABI-stripped package walks build_dir for real LICENSE, not SPDX template ---
 CASES=$((CASES + 1))
@@ -324,6 +312,106 @@ case "$BRO_TEXT" in
         FAIL=$((FAIL + 1))
         ;;
 esac
+rm -rf "$T"
+
+# --- Case 13: vendor-firmware override (.txt + .license) applied ---
+# No Makefile entry, so LIC would otherwise stay UNKNOWN. Override pair wins.
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/bin/targets/x/y" "$T/solarmatrix/licenses/vendor-firmware"
+printf 'vendor terms\n' > "$T/solarmatrix/licenses/vendor-firmware/my-blob.txt"
+printf 'Proprietary-MyVendor-Firmware\n' > "$T/solarmatrix/licenses/vendor-firmware/my-blob.license"
+printf 'my-blob - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 13: nonzero exit $RC"; FAIL=$((FAIL + 1)); }
+LICVAL=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="my-blob") | .license')
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="my-blob") | .text')
+assert_eq "Proprietary-MyVendor-Firmware" "$LICVAL" \
+    "case 13: license taken from override .license file"
+assert_contains "vendor terms" "$TEXT" \
+    "case 13: text taken from override .txt file"
+rm -rf "$T"
+
+# --- Case 14: license=UNKNOWN + no override = hard fail naming override paths ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/bin/targets/x/y"
+# No package/Makefile entry + no override => license=UNKNOWN survives.
+printf 'mystery - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+if OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>&1); then
+    echo "FAIL: case 14: expected nonzero exit, got 0"
+    FAIL=$((FAIL + 1))
+else
+    assert_contains "mystery" "$OUT" "case 14: stderr names package"
+    assert_contains "solarmatrix/licenses/vendor-firmware/mystery.{txt,license}" "$OUT" \
+        "case 14: stderr names expected override paths"
+fi
+rm -rf "$T"
+
+# --- Case 15: override .txt present but .license missing = hard fail ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/bin/targets/x/y" "$T/solarmatrix/licenses/vendor-firmware"
+printf 'lone text\n' > "$T/solarmatrix/licenses/vendor-firmware/lone.txt"
+# No lone.license sibling.
+printf 'lone - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+if OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>&1); then
+    echo "FAIL: case 15: expected nonzero exit, got 0"
+    FAIL=$((FAIL + 1))
+else
+    assert_contains "lone.license" "$OUT" "case 15: stderr names the missing .license sibling"
+fi
+rm -rf "$T"
+
+# --- Case 16: override wins over MIT + real LICENSE in build_dir ---
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/package/foo" "$T/build_dir/target-x/foo-1.0" \
+         "$T/bin/targets/x/y" "$T/solarmatrix/licenses/vendor-firmware"
+cat > "$T/package/foo/Makefile" <<'MK'
+define Package/foo
+endef
+PKG_NAME:=foo
+PKG_LICENSE:=MIT
+MK
+printf 'REAL BUILD_DIR LICENSE BYTES\n' > "$T/build_dir/target-x/foo-1.0/LICENSE"
+printf 'OVERRIDE WINS TEXT\n' > "$T/solarmatrix/licenses/vendor-firmware/foo.txt"
+printf 'Proprietary-Override\n' > "$T/solarmatrix/licenses/vendor-firmware/foo.license"
+printf 'foo - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+RC=0
+OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>/dev/null) || RC=$?
+[ $RC -eq 0 ] || { echo "FAIL: case 16: nonzero exit $RC"; FAIL=$((FAIL + 1)); }
+LICVAL=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="foo") | .license')
+TEXT=$(printf '%s' "$OUT" | jq -r '.notices[] | select(.name=="foo") | .text')
+assert_eq "Proprietary-Override" "$LICVAL" \
+    "case 16: override license wins over PKG_LICENSE=MIT"
+assert_contains "OVERRIDE WINS TEXT" "$TEXT" \
+    "case 16: override text wins over build_dir LICENSE bytes"
+case "$TEXT" in
+    *"REAL BUILD_DIR LICENSE BYTES"*)
+        echo "FAIL: case 16: text still carries build_dir bytes (override not applied)"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+rm -rf "$T"
+
+# --- Case 17: final gate catches override that smuggles UNKNOWN in .license ---
+# An override .license containing literal "UNKNOWN" is an override-author mistake;
+# final gate must still reject it (defense in depth — gate is last line of defense).
+CASES=$((CASES + 1))
+T=$(mktemp -d)
+mkdir -p "$T/bin/targets/x/y" "$T/solarmatrix/licenses/vendor-firmware"
+printf 'some terms\n' > "$T/solarmatrix/licenses/vendor-firmware/sneaky.txt"
+printf 'UNKNOWN\n' > "$T/solarmatrix/licenses/vendor-firmware/sneaky.license"
+printf 'sneaky - 1.0\n' > "$T/bin/targets/x/y/rootfs.manifest"
+if OUT=$(OPENWRT_TAG=test REPO_ROOT="$T" "$SCRIPT" 2>&1); then
+    echo "FAIL: case 17: expected nonzero exit, got 0"
+    FAIL=$((FAIL + 1))
+else
+    assert_contains "sneaky" "$OUT" "case 17: final gate names offender"
+    assert_contains "UNKNOWN" "$OUT" "case 17: gate reports license=UNKNOWN"
+fi
 rm -rf "$T"
 
 echo "--- $CASES cases, $FAIL failures ---"

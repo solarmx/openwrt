@@ -200,6 +200,58 @@ for ENTRY in "${NOTICES[@]}"; do
 done
 NOTICES=("${NEW_NOTICES[@]}")
 
+# Vendor-firmware override injection. Second post-pass, runs after ucode
+# inheritance so an override can still intentionally re-label a ucode-mod-*
+# entry if that ever becomes necessary. For each notice, if
+# solarmatrix/licenses/vendor-firmware/<name>.{txt,license} both exist, the
+# override wins over any other text/license resolution. Half-pair is a hard
+# fail — shipping one file without the other is always a commit mistake.
+OVERRIDE_DIR="$REPO_ROOT/solarmatrix/licenses/vendor-firmware"
+NEW_NOTICES=()
+for ENTRY in "${NOTICES[@]}"; do
+    NAME=$(printf '%s' "$ENTRY" | jq -r .name)
+    OV_TXT="$OVERRIDE_DIR/$NAME.txt"
+    OV_LIC="$OVERRIDE_DIR/$NAME.license"
+    if [ -f "$OV_TXT" ] && [ -f "$OV_LIC" ]; then
+        OV_LIC_ID=$(head -n1 "$OV_LIC" | tr -d '\r\n' | awk '{$1=$1};1')
+        ENTRY=$(jq -cn --arg l "$OV_LIC_ID" --rawfile t "$OV_TXT" \
+            --argjson base "$ENTRY" \
+            '$base | .license=$l | .text=$t')
+    elif [ -f "$OV_TXT" ] && [ ! -f "$OV_LIC" ]; then
+        echo "collect-licenses.sh: $NAME: found $OV_TXT but missing $OV_LIC" >&2
+        exit 1
+    elif [ ! -f "$OV_TXT" ] && [ -f "$OV_LIC" ]; then
+        echo "collect-licenses.sh: $NAME: found $OV_LIC but missing $OV_TXT" >&2
+        exit 1
+    fi
+    NEW_NOTICES+=("$ENTRY")
+done
+NOTICES=("${NEW_NOTICES[@]}")
+
+# Final gate: every notice must have non-empty text AND non-empty,
+# non-UNKNOWN license. Collect ALL offenders before exiting — a single run
+# should tell the operator every entry they need to fix, not just the first.
+BAD_LINES=()
+for ENTRY in "${NOTICES[@]}"; do
+    NAME=$(printf '%s' "$ENTRY" | jq -r .name)
+    LICVAL=$(printf '%s' "$ENTRY" | jq -r .license)
+    TXTVAL=$(printf '%s' "$ENTRY" | jq -r .text)
+    if [ -z "$LICVAL" ] || [ "$LICVAL" = "UNKNOWN" ]; then
+        DISP_LIC="${LICVAL:-<empty>}"
+        BAD_LINES+=("$NAME: license=$DISP_LIC. Create $OVERRIDE_DIR/$NAME.{txt,license} override.")
+    fi
+    if [ -z "$TXTVAL" ]; then
+        BAD_LINES+=("$NAME: text empty. Create $OVERRIDE_DIR/$NAME.{txt,license} override.")
+    fi
+done
+if [ "${#BAD_LINES[@]}" -gt 0 ]; then
+    echo "collect-licenses.sh: bad license metadata:" >&2
+    for LINE in "${BAD_LINES[@]}"; do
+        echo "  $LINE" >&2
+    done
+    exit 1
+fi
+
 # Assemble final document. Buffered notices array feeds jq -s to produce a
 # single JSON array, then combined with header fields.
 if [ "${#NOTICES[@]}" -eq 0 ]; then
