@@ -43,6 +43,15 @@ if [ $# -lt 1 ]; then
 fi
 TAG="$1"
 
+# Refuse to clobber a pre-existing version file. We register the cleanup
+# trap only AFTER this check so the trap can never delete a file the
+# script didn't create.
+if [ -e "$REPO_ROOT/version" ]; then
+    echo "ERROR: $REPO_ROOT/version already exists; refusing to overwrite" >&2
+    echo "  Remove it manually if it's leftover from a prior failed run." >&2
+    exit 1
+fi
+
 # Cleanup the top-level 'version' override so it doesn't pollute future
 # builds run outside this script.
 trap 'rm -f "$REPO_ROOT/version"' EXIT INT TERM
@@ -59,7 +68,13 @@ if [ -z "$INVOKING_BRANCH" ]; then
 fi
 
 step "Checking out $TAG (detached)"
-git checkout --detach "$TAG"
+# Force tag-scoped resolution so a branch name, commit SHA, "-",
+# or other arg form can't masquerade as a TAG.
+git rev-parse --verify "refs/tags/$TAG^{commit}" >/dev/null 2>&1 || {
+    echo "ERROR: '$TAG' is not a tag (no refs/tags/$TAG)" >&2
+    exit 1
+}
+git checkout --detach "refs/tags/$TAG"
 
 step "Overlaying solarmatrix/ from $INVOKING_BRANCH"
 git checkout "$INVOKING_BRANCH" -- solarmatrix/
