@@ -14,6 +14,7 @@ DEVICE_VARS += \
         CAMEO_KERNEL_PART \
         CAMEO_KERNEL_PART_SIZE \
         CAMEO_ROOTFS_PART \
+        FLASH_ADDR \
         H3C_DEVICE_ID \
         H3C_PRODUCT_ID \
 	LINKSYS_HEADER \
@@ -115,6 +116,15 @@ define Build/xikestor-nosimg
 	mv $@.new $@
 endef
 
+define Build/xikestor-sks7300-img
+	$(STAGING_DIR_HOST)/bin/sks7300-img \
+		-i $@ \
+		-o $@.new \
+		-n OpenWrt \
+		-v $(VERSION_DIST)$(firstword $(subst +, , $(firstword $(subst -, ,$(REVISION)))))
+	mv $@.new $@
+endef
+
 define Build/zynsig
 	$(STAGING_DIR_HOST)/bin/zynsig -i $@ \
 		-o $@.new
@@ -135,6 +145,7 @@ define Device/Default
 	uImage gzip
   DEVICE_DTS_DIR := ../dts
   DEVICE_DTS = $$(SOC)_$(1)
+  COMPILE :=
   IMAGES := sysupgrade.bin
   IMAGE/sysupgrade.bin := \
 	append-kernel | \
