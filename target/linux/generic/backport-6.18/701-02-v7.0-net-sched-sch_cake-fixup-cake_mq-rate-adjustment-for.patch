@@ -34,7 +34,7 @@ Signed-off-by: Jakub Kicinski <kuba@kernel.org>
  /* http://en.wikipedia.org/wiki/Methods_of_computing_square_roots
   * new_invsqrt = (invsqrt / 2) * (3 - count * invsqrt^2)
   *
-@@ -2045,12 +2045,9 @@ static struct sk_buff *cake_dequeue(stru
+@@ -2042,12 +2042,9 @@ static struct sk_buff *cake_dequeue(stru
  		if (num_active_qs > 1)
  			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
  

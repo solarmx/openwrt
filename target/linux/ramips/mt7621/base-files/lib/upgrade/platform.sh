@@ -73,6 +73,7 @@ platform_do_upgrade() {
 	arcadyan,we420223-99|\
 	asus,rt-ac65p|\
 	asus,rt-ac85p|\
+	asus,rt-ac85u|\
 	asus,rt-ax53u|\
 	asus,rt-ax54|\
 	asus,4g-ax56|\
@@ -228,6 +229,12 @@ platform_do_upgrade() {
 		;;
 	zyxel,wsm20)
 		zyxel_mstc_upgrade_prepare
+		nand_do_upgrade "$1"
+		;;
+	teltonika,rutm11|\
+	teltonika,rutm30|\
+	teltonika,rutm50)
+		CI_UBIPART="$(cmdline_get_var ubi.mtd)"
 		nand_do_upgrade "$1"
 		;;
 	*)

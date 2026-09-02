@@ -3,6 +3,7 @@
 #include <asm/mach-rtl-otto/mach-rtl-otto.h>
 #include <linux/etherdevice.h>
 
+#include "l3.h"
 #include "rtl-otto.h"
 
 #define RTL839X_VLAN_PORT_TAG_STS_UNTAG				0x0
@@ -223,7 +224,7 @@ inline void rtl839x_exec_tbl2_cmd(u32 cmd)
 	do { } while (sw_r32(RTL839X_TBL_ACCESS_CTRL_2) & (1 << 9));
 }
 
-static void rtl839x_vlan_tables_read(u32 vlan, struct rtl838x_vlan_info *info)
+static void rtl839x_vlan_tables_read(u32 vlan, struct rtldsa_vlan_info *info)
 {
 	u32 u, v, w;
 	/* Read VLAN table (0) via register 0 */
@@ -253,7 +254,7 @@ static void rtl839x_vlan_tables_read(u32 vlan, struct rtl838x_vlan_info *info)
 	info->untagged_ports = (info->untagged_ports << 21) | ((v >> 11) & 0x1fffff);
 }
 
-static void rtl839x_vlan_set_tagged(u32 vlan, struct rtl838x_vlan_info *info)
+static void rtl839x_vlan_set_tagged(u32 vlan, struct rtldsa_vlan_info *info)
 {
 	u32 u, v, w;
 	/* Access VLAN table (0) via register 0 */
@@ -663,14 +664,14 @@ static void rtl839x_enable_learning(int port, bool enable)
 		    RTL839X_L2_PORT_LRN_CONSTRT + (port << 2));
 }
 
-static void rtl839x_enable_flood(int port, bool enable)
+static void rtl839x_enable_flood(int port, enum rtldsa_flood_type mode)
 {
 	/* 0: Forward
 	 * 1: Disable
 	 * 2: to CPU
 	 * 3: Copy to CPU
 	 */
-	sw_w32_mask(0x3, enable ? 0 : 1,
+	sw_w32_mask(0x3, mode,
 		    RTL839X_L2_PORT_LRN_CONSTRT + (port << 2));
 }
 
@@ -1532,66 +1533,6 @@ static void rtl839x_packet_cntr_clear(int counter)
 	rtl_table_release(r);
 }
 
-static void rtl839x_route_read(int idx, struct rtl83xx_route *rt)
-{
-	u64 v;
-	/* Read ROUTING table (2) via register RTL8390_TBL_1 */
-	struct table_reg *r = rtl_table_get(RTL8390_TBL_1, 2);
-
-	pr_debug("In %s\n", __func__);
-	rtl_table_read(r, idx);
-
-	/* The table has a size of 2 registers */
-	v = sw_r32(rtl_table_data(r, 0));
-	v <<= 32;
-	v |= sw_r32(rtl_table_data(r, 1));
-	rt->switch_mac_id = (v >> 12) & 0xf;
-	rt->nh.gw = v >> 16;
-
-	rtl_table_release(r);
-}
-
-static void rtl839x_route_write(int idx, struct rtl83xx_route *rt)
-{
-	u32 v;
-
-	/* Read ROUTING table (2) via register RTL8390_TBL_1 */
-	struct table_reg *r = rtl_table_get(RTL8390_TBL_1, 2);
-
-	pr_debug("In %s\n", __func__);
-	sw_w32(rt->nh.gw >> 16, rtl_table_data(r, 0));
-	v = rt->nh.gw << 16;
-	v |= rt->switch_mac_id << 12;
-	sw_w32(v, rtl_table_data(r, 1));
-	rtl_table_write(r, idx);
-
-	rtl_table_release(r);
-}
-
-/* Configure the switch's own MAC addresses used when routing packets */
-static void rtl839x_setup_port_macs(struct rtl838x_switch_priv *priv)
-{
-	struct net_device *dev;
-	u64 mac;
-
-	pr_debug("%s: got port %08x\n", __func__, (u32)priv->ports[priv->r->cpu_port].dp);
-	dev = priv->ports[priv->r->cpu_port].dp->user;
-	mac = ether_addr_to_u64(dev->dev_addr);
-
-	for (int i = 0; i < 15; i++) {
-		mac++;  /* BUG: VRRP for testing */
-		sw_w32(mac >> 32, RTL839X_ROUTING_SA_CTRL + i * 8);
-		sw_w32(mac, RTL839X_ROUTING_SA_CTRL + i * 8 + 4);
-	}
-}
-
-static int rtl839x_l3_setup(struct rtl838x_switch_priv *priv)
-{
-	rtl839x_setup_port_macs(priv);
-
-	return 0;
-}
-
 static void rtl839x_vlan_port_keep_tag_set(int port, bool keep_outer, bool keep_inner)
 {
 	sw_w32(FIELD_PREP(RTL839X_VLAN_PORT_TAG_STS_CTRL_OTAG_STS_MASK,
@@ -1732,9 +1673,9 @@ const struct rtldsa_config rtldsa_839x_cfg = {
 	.port_iso_ctrl = rtl839x_port_iso_ctrl,
 	.l2_ctrl_0 = RTL839X_L2_CTRL_0,
 	.l2_ctrl_1 = RTL839X_L2_CTRL_1,
+	.self_mac_trap_ctrl = RTL839X_SPCL_TRAP_SWITCH_MAC_CTRL,
 	.l2_port_aging_out = RTL839X_L2_PORT_AGING_OUT,
 	.set_ageing_time = rtl839x_set_ageing_time,
-	.smi_poll_ctrl = RTL839X_SMI_PORT_POLLING_CTRL,
 	.l2_tbl_flush_ctrl = RTL839X_L2_TBL_FLUSH_CTRL,
 	.isr_glb_src = RTL839X_ISR_GLB_SRC,
 	.isr_port_link_sts_chg = RTL839X_ISR_PORT_LINK_STS_CHG,
@@ -1762,6 +1703,7 @@ const struct rtldsa_config rtldsa_839x_cfg = {
 	.set_static_move_action = rtl839x_set_static_move_action,
 	.stp_get = rtldsa_839x_stp_get,
 	.stp_set = rtl839x_stp_set,
+	.mac_force_mode_mask = RTL83XX_FORCE_EN | RTL83XX_FORCE_LINK_EN,
 	.mac_force_mode_ctrl = rtl839x_mac_force_mode_ctrl,
 	.mac_link_sts = RTL839X_MAC_LINK_STS,
 	.mac_port_ctrl = rtl839x_mac_port_ctrl,
@@ -1791,10 +1733,9 @@ const struct rtldsa_config rtldsa_839x_cfg = {
 	.l2_learning_setup = rtl839x_l2_learning_setup,
 	.packet_cntr_read = rtl839x_packet_cntr_read,
 	.packet_cntr_clear = rtl839x_packet_cntr_clear,
-	.route_read = rtl839x_route_read,
-	.route_write = rtl839x_route_write,
-	.l3_setup = rtl839x_l3_setup,
 	.set_receive_management_action = rtl839x_set_receive_management_action,
+	.get_egress_rate = rtldsa_839x_get_egress_rate,
+	.set_egress_rate = rtldsa_839x_set_egress_rate,
 	.qos_init = rtldsa_839x_qos_init,
 	.lag_set_distribution_algorithm = rtldsa_839x_set_distribution_algorithm,
 	.lag_set_port_members = rtldsa_839x_lag_set_port_members,
