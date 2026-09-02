@@ -11,14 +11,26 @@ From a fresh clone:
 ```sh
 git clone https://github.com/solarmx/openwrt
 cd openwrt
-./solarmatrix/build-firmware.sh prereqs    # one-time: install apt dependencies
-./solarmatrix/build-firmware.sh            # build
+./solarmatrix/build-firmware.sh prereqs      # one-time: install apt dependencies
+./solarmatrix/build-firmware.sh v25.12.5     # build a named release
+./solarmatrix/build-firmware.sh latest       # build the newest stable release
+```
+
+The tag argument is required. `latest` resolves to the newest stable
+`vMAJOR.MINOR.PATCH` tag present in your clone, excluding release
+candidates; it is resolved once, up front, so the checkout, the pinned
+`version` file, `tag.txt` and the license manifest all record the concrete
+tag that was built. Fetch upstream tags first if the fork is behind:
+
+```sh
+git fetch upstream --tags     # or use GitHub's "Sync fork" button
 ```
 
 The script:
 
-1. Picks the latest stable `vMAJOR.MINOR.PATCH` tag from your local clone
-   (use GitHub's "Sync fork" button to pull newer upstream tags when needed).
+1. Resolves the tag argument, and refuses anything that is not a real
+   `refs/tags/` entry so a branch name or commit SHA cannot masquerade as
+   a release.
 2. Checks out that tag in detached mode.
 3. Overlays `solarmatrix/` back onto the tag's tree so these build scripts
    remain available.

@@ -2,8 +2,14 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Builds the SolarMatrix firmware from this OpenWRT fork.
-# Takes an explicit OpenWRT tag argument, builds, and emits
-# firmware + licenses JSON under solarmatrix/out/.
+# Takes an OpenWRT tag argument -- or the word "latest", which resolves to
+# the newest stable upstream release tag -- builds, and emits firmware +
+# licenses JSON under solarmatrix/out/.
+#
+# "latest" is resolved once, up front, and everything downstream sees the
+# concrete tag it resolved to: the checkout, the version file, tag.txt and
+# the license manifest. A build is therefore still reproducible after the
+# fact, because the artifacts record which tag was actually built.
 #
 # This script is part of the GPL-2.0 OpenWRT fork. It contains no proprietary
 # SolarMatrix code and never reads from the controller repository.
@@ -37,11 +43,27 @@ if [ "${1:-}" = "prereqs" ]; then
 fi
 
 if [ $# -lt 1 ]; then
-    echo "usage: $0 <openwrt-tag>" >&2
-    echo "Example: $0 v25.12.2" >&2
+    echo "usage: $0 <openwrt-tag>|latest" >&2
+    echo "Example: $0 v25.12.5" >&2
+    echo "         $0 latest      # newest stable upstream release" >&2
     exit 1
 fi
 TAG="$1"
+
+# "latest" means the newest stable upstream release tag. Release candidates
+# are excluded: an rc is not something to ship. Sorting is -V so that
+# v25.12.10 would rank above v25.12.9 rather than below it, which a plain
+# lexical sort gets wrong the moment a series reaches double digits.
+if [ "$TAG" = "latest" ]; then
+    step "Resolving 'latest' to the newest stable upstream tag"
+    TAG="$(git tag -l 'v[0-9]*' | grep -vE -- '-?rc[0-9]*$' | sort -V | tail -1)"
+    if [ -z "$TAG" ]; then
+        echo "ERROR: no stable vN tags found. Fetch them first:" >&2
+        echo "  git fetch upstream --tags   # or: git fetch origin --tags" >&2
+        exit 1
+    fi
+    echo "Resolved: $TAG"
+fi
 
 # Refuse to clobber a pre-existing version file. We register the cleanup
 # trap only AFTER this check so the trap can never delete a file the
