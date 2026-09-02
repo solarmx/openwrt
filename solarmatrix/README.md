@@ -34,15 +34,61 @@ The script:
 2. Checks out that tag in detached mode.
 3. Overlays `solarmatrix/` back onto the tag's tree so these build scripts
    remain available.
-4. Writes a hardcoded `.config` for **OpenWRT One** (MediaTek MT7981B,
+4. Stages `solarmatrix/files/` as the top-level `files/` rootfs overlay, which
+   OpenWRT copies verbatim into the image (see [Device hardening](#device-hardening)).
+5. Writes a hardcoded `.config` for **OpenWRT One** (MediaTek MT7981B,
    filogic subtarget, device `openwrt_one`).
-5. Runs `make -j<nproc>` to produce firmware.
-6. Generates `solarmatrix/out/openwrt-licenses.json` listing every
+6. Runs `make -j<nproc>` to produce firmware.
+7. Verifies the hardening overlay actually reached the rootfs, and fails the
+   build if it did not.
+8. Generates `solarmatrix/out/openwrt-licenses.json` listing every
    installed package's OSS license (per the build manifest).
-7. Copies firmware images to `solarmatrix/out/`.
+9. Copies firmware images to `solarmatrix/out/`.
+
+Both `version` and `files/` are generated at build time and removed again by
+the script's exit trap; it refuses to start if either already exists.
 
 Hardware target is fixed to OpenWRT One; adding other targets would
 require changing the hardcoded `.config` in `build-firmware.sh`.
+
+## Device hardening
+
+`solarmatrix/files/` is copied verbatim into the rootfs. It carries the two
+scripts that keep root off the network:
+
+| File | When it runs | What it does |
+|------|--------------|--------------|
+| `etc/uci-defaults/99-solarmatrix-hardening` | Once, at first boot after flashing | Sets `dropbear.@dropbear[0].DirectInterface='lan'` so SSH is bound to `br-lan` (wired LAN plus both WiFi APs) and never to WAN. Disables `uhttpd` if present, since it can only listen on the `0.0.0.0` wildcard and the controller owns port 80. |
+| `sbin/solarmatrix-harden-ssh` | Last step of provisioning, and by hand after any recovery | Sets `PasswordAuth='off'` and `RootPasswordAuth='off'`, reads them back, and restarts dropbear. After this the device accepts no password over SSH. |
+
+The device keeps a unique, strong root password — it is generated per device
+during provisioning, written to `/solarmatrix/config.json`, and applied to the
+account. It is simply not accepted from the network, and it is never printed.
+
+Password authentication is left on at first boot on purpose: provisioning
+authenticates as root over the LAN to finish setting the device up, and only
+then locks it down.
+
+**Recovery.** With no password authentication, root is reached through OpenWRT
+failsafe mode, which requires physical access. Failsafe is unaffected by any of
+the above: `/lib/preinit/99_10_failsafe_dropbear` starts its own dropbear with
+an explicit command line and a throwaway host key, and
+`/lib/preinit/99_10_failsafe_login` opens a serial console shell — neither
+reads `/etc/config/dropbear`. The full runbook lives in
+[`docs/RECOVERY.md`](https://github.com/solar-matrix/provisioning/blob/main/docs/RECOVERY.md)
+in the provisioning repository.
+
+## Tests
+
+The scripts in this directory are covered by shell test suites, run directly:
+
+```sh
+./solarmatrix/collect-licenses_test.sh
+./solarmatrix/hardening_test.sh
+```
+
+`hardening_test.sh` runs the hardening scripts against a fake `uci` and `service`
+on `PATH` and asserts on the resulting UCI state, so it needs no device.
 
 ## Outputs
 

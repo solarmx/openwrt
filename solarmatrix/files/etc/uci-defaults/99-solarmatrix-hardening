@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Confines management access to the LAN bridge on first boot.
+#
+# The device ships into shared building infrastructure, so nothing that can
+# hand out a shell or a config page may listen on the WAN side. br-lan carries
+# the wired LAN ports and both WiFi APs, so binding there keeps the installer
+# and the resident reachable while removing every management listener from WAN.
+#
+# Root password authentication is deliberately NOT switched off here: the
+# provisioning tool still authenticates as root over the LAN to finish setting
+# the device up. It runs /sbin/solarmatrix-harden-ssh as its final step, and
+# that is what makes root unauthenticable over the network from then on.
+
+set -e
+
+# Bind to the bridge device itself rather than to its addresses, so the socket
+# follows the interface across address changes instead of outliving them.
+uci set dropbear.@dropbear[0].DirectInterface='lan'
+uci commit dropbear
+
+# uhttpd listens on the 0.0.0.0 wildcard and has no interface option to
+# constrain it, so it cannot be made LAN-only. The controller serves the local
+# portal on port 80 instead, so uhttpd is simply not wanted on this device.
+# Only 'disable' is needed: uci-defaults run from /etc/init.d/boot (START=10),
+# well before uhttpd (START=50) would have started.
+if uci -q show uhttpd >/dev/null 2>&1; then
+	service uhttpd disable
+fi
+
+exit 0

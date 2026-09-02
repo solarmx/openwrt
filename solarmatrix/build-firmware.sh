@@ -65,18 +65,20 @@ if [ "$TAG" = "latest" ]; then
     echo "Resolved: $TAG"
 fi
 
-# Refuse to clobber a pre-existing version file. We register the cleanup
-# trap only AFTER this check so the trap can never delete a file the
-# script didn't create.
-if [ -e "$REPO_ROOT/version" ]; then
-    echo "ERROR: $REPO_ROOT/version already exists; refusing to overwrite" >&2
-    echo "  Remove it manually if it's leftover from a prior failed run." >&2
-    exit 1
-fi
+# Refuse to clobber a pre-existing version file or rootfs overlay. We register
+# the cleanup trap only AFTER these checks so the trap can never delete a file
+# the script didn't create.
+for GENERATED in version files; do
+    if [ -e "$REPO_ROOT/$GENERATED" ]; then
+        echo "ERROR: $REPO_ROOT/$GENERATED already exists; refusing to overwrite" >&2
+        echo "  Remove it manually if it's leftover from a prior failed run." >&2
+        exit 1
+    fi
+done
 
-# Cleanup the top-level 'version' override so it doesn't pollute future
-# builds run outside this script.
-trap 'rm -f "$REPO_ROOT/version"' EXIT INT TERM
+# Cleanup the top-level 'version' override and 'files' overlay so they don't
+# pollute future builds run outside this script.
+trap 'rm -rf "$REPO_ROOT/version" "$REPO_ROOT/files"' EXIT INT TERM
 
 step "Target OpenWRT tag: $TAG"
 
@@ -100,6 +102,13 @@ git checkout --detach "refs/tags/$TAG"
 
 step "Overlaying solarmatrix/ from $INVOKING_BRANCH"
 git checkout "$INVOKING_BRANCH" -- solarmatrix/
+
+# OpenWRT's package/install copies $TOPDIR/files verbatim over the rootfs
+# (include/rootfs.mk: prepare_rootfs). That is how the SolarMatrix hardening
+# scripts get into the image; the tag checkout above does not carry them, so
+# stage them on every build.
+step "Staging solarmatrix/files as the rootfs overlay"
+cp -a "$REPO_ROOT/solarmatrix/files" "$REPO_ROOT/files"
 
 # OpenWRT's scripts/getver.sh checks $TOPDIR/version before its
 # commit-counting fallback. Pinning it makes version.buildinfo (and
@@ -131,6 +140,18 @@ if [ "$ACTUAL" != "$TAG" ]; then
     echo "  Did the version file override fail?" >&2
     exit 1
 fi
+
+# A hardening script that silently failed to reach the rootfs would ship a
+# device with SSH on the WAN-facing wildcard socket, so make its absence a
+# build failure rather than a surprise in the field.
+step "Verifying the hardening overlay reached the rootfs"
+HARDENING_IN_ROOTFS="$(find build_dir -maxdepth 5 -path '*/root-*/etc/uci-defaults/99-solarmatrix-hardening' | head -1)"
+if [ -z "$HARDENING_IN_ROOTFS" ]; then
+    echo "ERROR: solarmatrix/files was not applied to the rootfs" >&2
+    echo "  Expected build_dir/target-*/root-*/etc/uci-defaults/99-solarmatrix-hardening" >&2
+    exit 1
+fi
+echo "Found: $HARDENING_IN_ROOTFS"
 
 step "Collecting OpenWRT licenses"
 mkdir -p "$OUT_DIR"
