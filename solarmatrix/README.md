@@ -80,8 +80,12 @@ The NVMe survives every such wipe, so it is the authority on what the device is:
 | `config.json`, no `.provisioned` | Mid-provisioning. Root password applied from `config.json`; password auth stays on, because the provisioning run needs it over the LAN. |
 | `config.json` + `.provisioned` | A live unit. Root password applied **and** password auth disabled. |
 
-`.provisioned` is written by the provisioning tool only after it has reconnected
-and confirmed from the network that a root password is refused.
+`.provisioned` is written by the provisioning tool over the last SSH session
+there will be, immediately before it locks the device — it cannot be written
+afterwards, because by then nothing can log in. The run then reconnects and
+refuses to report success unless a root password is actually refused, so the
+marker means "provisioning reached the end" while the run's exit status is what
+says the device is fit to ship.
 
 The script **fails closed**: if `config.json` is present but the password cannot
 be applied, password authentication goes off anyway. A device that needs failsafe
