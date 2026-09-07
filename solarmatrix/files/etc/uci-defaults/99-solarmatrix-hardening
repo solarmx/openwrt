@@ -1,32 +1,145 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Confines management access to the LAN bridge on first boot.
+# Establishes the device's security posture on every boot that follows a
+# configuration wipe. It runs from /etc/init.d/boot (START=10), before dropbear
+# (START=19) has bound a socket, so everything it decides is in force before the
+# first packet can be answered.
 #
-# The device ships into shared building infrastructure, so nothing that can
-# hand out a shell or a config page may listen on the WAN side. br-lan carries
-# the wired LAN ports and both WiFi APs, so binding there keeps the installer
-# and the resident reachable while removing every management listener from WAN.
+# It runs after a firmware flash, after `firstboot`, and -- the case that makes
+# it load-bearing -- after a five-second press of the reset button, which runs
+# `factoryreset -y` (/etc/rc.button/reset). That wipes the overlay, and both
+# /etc/config/dropbear and /etc/shadow are overlay files. Without this script a
+# button press would leave a provisioned device with password authentication
+# back on and no root password at all: dropbear accepts the `none` method for
+# root with an empty hash (600-allow-blank-root-password.patch). In a shared
+# electrical room, the people who can reach that button are the threat.
 #
-# Root password authentication is deliberately NOT switched off here: the
-# provisioning tool still authenticates as root over the LAN to finish setting
-# the device up. It runs /sbin/solarmatrix-harden-ssh as its final step, and
-# that is what makes root unauthenticable over the network from then on.
+# The NVMe survives every one of those wipes, so it is the authority on what
+# the device is:
+#
+#   no config.json              -> unprovisioned. Nothing to protect; leave root
+#                                  open so the provisioning tool can reach it,
+#                                  and keep both WiFi APs down so that window is
+#                                  wired-only.
+#   config.json, no marker      -> mid-provisioning. Apply the root password so
+#                                  the window between flashing and the factory
+#                                  reset is not passwordless, but leave password
+#                                  authentication on: the provisioning run needs
+#                                  it over the LAN.
+#   config.json + .provisioned  -> a live unit. Apply the root password and
+#                                  disable password authentication.
+#
+# It fails closed: if config.json is there but the password cannot be applied,
+# password authentication goes off regardless. A device that needs failsafe to
+# recover is recoverable; a passwordless rootable one in a shared building is
+# not.
+#
+# Each concern is independent and reads its result back. This script runs
+# unattended with nobody watching its exit code, so a setting that did not take
+# has to end up in the log rather than in the field. Deliberately no `set -e`:
+# one failed concern must not silently skip the rest.
 
-set -e
+NVME_DEV="${SOLARMATRIX_NVME_DEV:-/dev/nvme0n1p1}"
+NVME_MNT="${SOLARMATRIX_NVME_MNT:-/tmp/solarmatrix-boot}"
+NVME_WAIT="${SOLARMATRIX_NVME_WAIT:-10}"
 
-# Bind to the bridge device itself rather than to its addresses, so the socket
-# follows the interface across address changes instead of outliving them.
-uci set dropbear.@dropbear[0].DirectInterface='lan'
-uci commit dropbear
+failed=0
 
-# uhttpd listens on the 0.0.0.0 wildcard and has no interface option to
-# constrain it, so it cannot be made LAN-only. The controller serves the local
-# portal on port 80 instead, so uhttpd is simply not wanted on this device.
-# Only 'disable' is needed: uci-defaults run from /etc/init.d/boot (START=10),
-# well before uhttpd (START=50) would have started.
+crit() {
+	logger -t solarmatrix-hardening -p daemon.crit "$1"
+	echo "solarmatrix-hardening: $1" >&2
+	failed=1
+}
+
+# Sets a UCI option, commits its package, and reads it back. A security setting
+# that quietly failed to apply is the failure mode this whole script exists to
+# prevent, so it is never assumed to have worked.
+uci_set_verified() {
+	local key="$1" want="$2" got=''
+
+	uci set "$key=$want" 2>/dev/null
+	uci commit "${key%%.*}" 2>/dev/null
+
+	got="$(uci -q get "$key")" || got='(unset)'
+	[ "$got" = "$want" ] && return 0
+
+	crit "$key is '$got', expected '$want'"
+	return 1
+}
+
+# --- Concern 1: SSH is offered on the LAN bridge and nowhere else ------------
+# br-lan carries the wired LAN ports and both WiFi APs. Binding to the device
+# rather than to its addresses means the socket follows the bridge instead of
+# outliving an address change.
+uci_set_verified 'dropbear.@dropbear[0].DirectInterface' 'lan'
+
+# --- Concern 2: no wildcard-bound web server --------------------------------
+# uhttpd listens on 0.0.0.0 and has no option to constrain it to an interface,
+# so it cannot be made LAN-only. The controller serves the local portal on port
+# 80 instead.
 if uci -q show uhttpd >/dev/null 2>&1; then
-	service uhttpd disable
+	service uhttpd disable || crit "could not disable uhttpd"
 fi
 
+# --- Concern 3: read the device's identity off the NVMe ---------------------
+provisioned=0
+have_config=0
+root_password=''
+
+wait_for_nvme() {
+	local i=0
+	while [ "$i" -lt "$NVME_WAIT" ]; do
+		[ -e "$NVME_DEV" ] && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
+# Mounted read-only and unmounted again straight away: /etc/init.d/solarmatrix-mount
+# (START=20) owns the real mount, and this must not be holding it later.
+if wait_for_nvme; then
+	mkdir -p "$NVME_MNT"
+	if mount -o ro "$NVME_DEV" "$NVME_MNT" 2>/dev/null; then
+		[ -f "$NVME_MNT/config.json" ] && have_config=1
+		[ -f "$NVME_MNT/.provisioned" ] && provisioned=1
+		if [ "$have_config" = 1 ]; then
+			root_password="$(jsonfilter -i "$NVME_MNT/config.json" -e '@.root_password')" || root_password=''
+		fi
+		umount "$NVME_MNT" 2>/dev/null
+	fi
+fi
+
+# --- Concern 4: apply the root password, and decide whether to lock SSH -----
+harden=0
+[ "$provisioned" = 1 ] && harden=1
+
+if [ "$have_config" = 1 ]; then
+	if [ -z "$root_password" ]; then
+		crit "config.json carries no root_password; locking SSH instead"
+		harden=1
+	elif ! printf 'root:%s\n' "$root_password" | chpasswd; then
+		crit "could not apply the root password from config.json; locking SSH instead"
+		harden=1
+	fi
+fi
+
+if [ "$harden" = 1 ]; then
+	solarmatrix-harden-ssh || crit "could not disable SSH password authentication"
+else
+	# Unprovisioned, so root is reachable without a credential by design. Keep
+	# that reachable over the wire only: an AP that came up enabled and open
+	# would put it on the air. OpenWrt One carries no wlan defaults today
+	# (target/linux/mediatek/filogic/base-files/etc/board.d/04_defaults), so
+	# mac80211.uc generates the interfaces disabled and this is a no-op -- but
+	# the window must not depend on that holding across an OpenWrt bump.
+	for section in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+		uci_set_verified "wireless.$section.disabled" '1'
+	done
+fi
+
+# A non-zero exit leaves this script in place, so a boot that could not finish
+# the job tries again on the next one.
+[ "$failed" = 0 ] || exit 1
 exit 0

@@ -110,6 +110,16 @@ git checkout "$INVOKING_BRANCH" -- solarmatrix/
 step "Staging solarmatrix/files as the rootfs overlay"
 cp -a "$REPO_ROOT/solarmatrix/files" "$REPO_ROOT/files"
 
+# build_dir is not cleaned between builds, so a previous build's copy of these
+# files would satisfy the post-build check even if this build never applied the
+# overlay. Delete them first so only a real application can put them back.
+if [ -d build_dir ]; then
+    find build_dir -maxdepth 5 \
+        \( -path '*/root-*/etc/uci-defaults/99-solarmatrix-hardening' \
+        -o -path '*/root-*/sbin/solarmatrix-harden-ssh' \) \
+        -delete
+fi
+
 # OpenWRT's scripts/getver.sh checks $TOPDIR/version before its
 # commit-counting fallback. Pinning it makes version.buildinfo (and
 # /etc/openwrt_release in the rootfs) the literal tag string.
@@ -142,16 +152,29 @@ if [ "$ACTUAL" != "$TAG" ]; then
 fi
 
 # A hardening script that silently failed to reach the rootfs would ship a
-# device with SSH on the WAN-facing wildcard socket, so make its absence a
-# build failure rather than a surprise in the field.
+# device that answers a root password on the LAN, so make it a build failure
+# rather than a surprise in the field. Both files matter: without harden-ssh the
+# boot script and the provisioning tool cannot lock the device at all.
+# Compared byte for byte, not merely found, so a stale or truncated copy fails.
 step "Verifying the hardening overlay reached the rootfs"
-HARDENING_IN_ROOTFS="$(find build_dir -maxdepth 5 -path '*/root-*/etc/uci-defaults/99-solarmatrix-hardening' | head -1)"
-if [ -z "$HARDENING_IN_ROOTFS" ]; then
-    echo "ERROR: solarmatrix/files was not applied to the rootfs" >&2
-    echo "  Expected build_dir/target-*/root-*/etc/uci-defaults/99-solarmatrix-hardening" >&2
+ROOTFS_DIR="$(find build_dir -maxdepth 2 -type d -name 'root-*' | head -1)"
+if [ -z "$ROOTFS_DIR" ]; then
+    echo "ERROR: no rootfs staging directory under build_dir" >&2
     exit 1
 fi
-echo "Found: $HARDENING_IN_ROOTFS"
+for OVERLAY_FILE in etc/uci-defaults/99-solarmatrix-hardening sbin/solarmatrix-harden-ssh; do
+    if ! cmp -s "$REPO_ROOT/solarmatrix/files/$OVERLAY_FILE" "$ROOTFS_DIR/$OVERLAY_FILE"; then
+        echo "ERROR: $OVERLAY_FILE does not match solarmatrix/files/ in the rootfs" >&2
+        echo "  Expected: $REPO_ROOT/solarmatrix/files/$OVERLAY_FILE" >&2
+        echo "  In rootfs: $ROOTFS_DIR/$OVERLAY_FILE" >&2
+        exit 1
+    fi
+    if [ ! -x "$ROOTFS_DIR/$OVERLAY_FILE" ]; then
+        echo "ERROR: $OVERLAY_FILE is not executable in the rootfs" >&2
+        exit 1
+    fi
+    echo "Verified: $ROOTFS_DIR/$OVERLAY_FILE"
+done
 
 step "Collecting OpenWRT licenses"
 mkdir -p "$OUT_DIR"

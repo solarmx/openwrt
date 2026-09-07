@@ -4,16 +4,16 @@
 # Makes root unauthenticable over the network.
 #
 # The device still has a unique, strong root password -- it is written to
-# /solarmatrix/config.json during provisioning and applied to the account --
-# but after this script has run, dropbear will not accept it, or any other
-# password, from the network. Root remains reachable through OpenWrt failsafe
-# mode, which needs physical access to the device: failsafe starts its own
-# dropbear from /lib/preinit/99_10_failsafe_dropbear with an explicit command
-# line and reads none of the configuration touched here.
+# /solarmatrix/config.json during provisioning and applied to the account -- but
+# after this script has run, dropbear will not accept it, or any other password,
+# from the network. Root remains reachable through OpenWrt failsafe mode, which
+# needs physical access: failsafe starts its own dropbear from
+# /lib/preinit/99_10_failsafe_dropbear with an explicit command line and reads
+# none of the configuration touched here.
 #
-# The provisioning tool runs this as its last step. Run it by hand after any
-# recovery that reset the configuration -- see docs/RECOVERY.md in the
-# provisioning repository.
+# Run by /etc/uci-defaults/99-solarmatrix-hardening on the boot after a
+# configuration wipe, by the provisioning tool as its last step, and by hand
+# after any recovery -- see docs/RECOVERY.md in the provisioning repository.
 
 set -e
 
@@ -32,6 +32,15 @@ for opt in PasswordAuth RootPasswordAuth; do
 	fi
 done
 
-service dropbear restart
+# Best-effort: the committed configuration is what survives, and `uci commit`
+# has already fired dropbear's config.change trigger. A restart that returns
+# non-zero -- during boot, before the lan interface is up, it will -- must not
+# fail a device whose configuration is correct. What the running daemon actually
+# accepts is verified from the network by the provisioning tool, which is the
+# only place that can prove it.
+if ! service dropbear restart; then
+	logger -t solarmatrix-harden-ssh -p daemon.warn \
+		"dropbear restart returned non-zero; settings are committed and take effect on reload"
+fi
 
 echo "SSH password authentication disabled; root is reachable only via failsafe mode."
