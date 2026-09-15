@@ -131,10 +131,22 @@ if [ -d build_dir ]; then
 fi
 
 # OpenWRT's scripts/getver.sh checks $TOPDIR/version before its
-# commit-counting fallback. Pinning it makes version.buildinfo (and
-# /etc/openwrt_release in the rootfs) the literal tag string.
-step "Pinning version.buildinfo to $TAG via top-level version file"
-echo "$TAG" > "$REPO_ROOT/version"
+# commit-counting fallback. Pinning it fixes version.buildinfo and
+# DISTRIB_RELEASE in /etc/openwrt_release.
+#
+# The leading "v" is stripped, because this is a version number and not a git
+# ref. base-files builds its own package version as PKG_RELEASE~VERSION_NUMBER,
+# and apk -- which replaced opkg as the package manager in this release series
+# -- refuses a version that does not begin with a digit:
+#
+#   apk mkpkg --info "version:1711~v25.12.5"
+#   ERROR: info field 'version' has invalid value: package version is invalid
+#
+# That fails the whole build at package/base-files. Upstream releases set this
+# to 25.12.5 for the tag v25.12.5, and this now matches them.
+VERSION_NUMBER="${TAG#v}"
+step "Pinning version.buildinfo to $VERSION_NUMBER via top-level version file"
+echo "$VERSION_NUMBER" > "$REPO_ROOT/version"
 
 # make defconfig silently drops any CONFIG_PACKAGE_ symbol it does not
 # recognise, and everything outside package/ -- tailscale, curl, wget-ssl,
@@ -277,15 +289,15 @@ echo "Verified: all 8 requested packages are selected"
 step "Building (this is slow)"
 make -j"$(nproc)" V=s
 
-step "Verifying version.buildinfo matches $TAG"
+step "Verifying version.buildinfo matches $VERSION_NUMBER"
 BUILDINFO_FILE="$(find bin/targets -maxdepth 4 -name 'version.buildinfo' | head -1)"
 if [ -z "$BUILDINFO_FILE" ]; then
     echo "ERROR: no version.buildinfo emitted by build" >&2
     exit 1
 fi
 ACTUAL="$(cat "$BUILDINFO_FILE")"
-if [ "$ACTUAL" != "$TAG" ]; then
-    echo "ERROR: version.buildinfo='$ACTUAL', expected '$TAG'" >&2
+if [ "$ACTUAL" != "$VERSION_NUMBER" ]; then
+    echo "ERROR: version.buildinfo='$ACTUAL', expected '$VERSION_NUMBER'" >&2
     echo "  $BUILDINFO_FILE" >&2
     echo "  Did the version file override fail?" >&2
     exit 1
