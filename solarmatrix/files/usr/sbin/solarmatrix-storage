@@ -1,0 +1,145 @@
+#!/bin/sh
+
+# SolarMatrix Storage Management Utility
+
+MOUNT_POINT="/solarmatrix"
+LOGFILE="/tmp/solarmatrix-mount.log"
+
+show_status() {
+    echo "=== SolarMatrix Storage Status ==="
+    
+    if mount | grep -q " ${MOUNT_POINT} "; then
+        DEVICE=$(mount | grep " ${MOUNT_POINT} " | awk '{print $1}')
+        FS_TYPE=$(mount | grep " ${MOUNT_POINT} " | awk '{print $5}')
+        USAGE=$(df -h "${MOUNT_POINT}" | tail -1 | awk '{printf "%s / %s (%s full)", $3, $2, $5}')
+        
+        echo "Status: MOUNTED"
+        echo "Device: ${DEVICE}"
+        echo "Filesystem: ${FS_TYPE}"
+        echo "Mount Point: ${MOUNT_POINT}"
+        echo "Usage: ${USAGE}"
+        echo "Auto-mount: YES"
+        
+        if [ -f "${MOUNT_POINT}/.solarmatrix-mount" ]; then
+            echo "Mounted: $(cat "${MOUNT_POINT}/.solarmatrix-mount")"
+        fi
+    else
+        echo "Status: NOT MOUNTED"
+        echo "Mount Point: ${MOUNT_POINT}"
+        echo "Auto-mount: YES"
+    fi
+}
+
+list_devices() {
+    echo "=== Available NVMe Devices ==="
+    echo ""
+    
+    for device in /dev/nvme*n*; do
+        [ -b "${device}" ] || continue
+        
+        echo "Device: ${device}"
+        
+        FS_TYPE=$(blkid -s TYPE -o value "${device}" 2>/dev/null || \
+                  block info "${device}" 2>/dev/null | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || \
+                  echo "None detected")
+        SIZE=$(blockdev --getsize64 "${device}" 2>/dev/null || echo "Unknown")
+        
+        echo "  Filesystem: ${FS_TYPE}"
+        [ "${SIZE}" != "Unknown" ] && echo "  Size: ${SIZE} bytes"
+        
+        # Check for partitions
+        if ls "${device}p"* >/dev/null 2>&1; then
+            echo "  Partitions:"
+            for part in "${device}p"*; do
+                [ -b "${part}" ] || continue
+                PART_FS=$(blkid -s TYPE -o value "${part}" 2>/dev/null || \
+                          block info "${part}" 2>/dev/null | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || \
+                          echo "unknown")
+                PART_SIZE=$(blockdev --getsize64 "${part}" 2>/dev/null || echo "?")
+                echo "    ${part}: ${PART_FS} (${PART_SIZE} bytes)"
+            done
+        fi
+        echo ""
+    done
+}
+
+do_mount() {
+    if mount | grep -q " ${MOUNT_POINT} "; then
+        echo "Already mounted"
+        show_status
+        return 0
+    fi
+    
+    echo "Attempting to mount NVMe drive..."
+    /etc/init.d/solarmatrix-mount start
+    sleep 1
+    show_status
+}
+
+do_unmount() {
+    if ! mount | grep -q " ${MOUNT_POINT} "; then
+        echo "Not currently mounted"
+        return 0
+    fi
+    
+    echo "Unmounting ${MOUNT_POINT}..."
+    umount "${MOUNT_POINT}" && echo "Successfully unmounted" || echo "Failed to unmount"
+}
+
+show_help() {
+    cat << 'HELP'
+SolarMatrix Storage Management Utility
+
+Usage: solarmatrix-storage <command>
+
+Commands:
+  status    - Show current mount status
+  list      - List available NVMe devices
+  info      - Show status + list devices
+  mount     - Manually trigger mount
+  umount    - Manually unmount
+  remount   - Unmount and remount
+  help      - Show this help message
+
+Examples:
+  solarmatrix-storage status
+  solarmatrix-storage list
+  solarmatrix-storage mount
+
+Logs: /tmp/solarmatrix-mount.log
+HELP
+}
+
+case "${1:-}" in
+    status)
+        show_status
+        ;;
+    list)
+        list_devices
+        ;;
+    info)
+        show_status
+        echo ""
+        list_devices
+        ;;
+    mount)
+        do_mount
+        ;;
+    umount|unmount)
+        do_unmount
+        ;;
+    remount)
+        do_unmount
+        sleep 1
+        do_mount
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    *)
+        echo "Error: Unknown command '${1:-}'"
+        echo ""
+        show_help
+        exit 1
+        ;;
+esac

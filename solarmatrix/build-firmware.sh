@@ -42,13 +42,19 @@ if [ "${1:-}" = "prereqs" ]; then
     exit 0
 fi
 
-if [ $# -lt 1 ]; then
-    echo "usage: $0 <openwrt-tag>|latest" >&2
-    echo "Example: $0 v25.12.5" >&2
-    echo "         $0 latest      # newest stable upstream release" >&2
+# The tag this firmware is pinned to. A build with no argument builds this,
+# so the pin lives in git and a plain ./build-firmware.sh is reproducible.
+# An explicit tag or "latest" still overrides it.
+PINNED_TAG="v25.12.5"
+
+if [ $# -gt 1 ]; then
+    echo "usage: $0 [<openwrt-tag>|latest]" >&2
+    echo "Example: $0                # build the pinned tag ($PINNED_TAG)" >&2
+    echo "         $0 v25.12.5       # build a named release" >&2
+    echo "         $0 latest         # newest stable upstream release" >&2
     exit 1
 fi
-TAG="$1"
+TAG="${1:-$PINNED_TAG}"
 
 # "latest" means the newest stable upstream release tag. Release candidates
 # are excluded: an rc is not something to ship. Sorting is -V so that
@@ -116,7 +122,11 @@ cp -a "$REPO_ROOT/solarmatrix/files" "$REPO_ROOT/files"
 if [ -d build_dir ]; then
     find build_dir -maxdepth 5 \
         \( -path '*/root-*/etc/uci-defaults/99-solarmatrix-hardening' \
-        -o -path '*/root-*/sbin/solarmatrix-harden-ssh' \) \
+        -o -path '*/root-*/sbin/solarmatrix-harden-ssh' \
+        -o -path '*/root-*/etc/hotplug.d/block/20-solarmatrix-nvme' \
+        -o -path '*/root-*/etc/init.d/solarmatrix-mount' \
+        -o -path '*/root-*/etc/init.d/solarmatrix' \
+        -o -path '*/root-*/usr/sbin/solarmatrix-storage' \) \
         -delete
 fi
 
@@ -126,13 +136,143 @@ fi
 step "Pinning version.buildinfo to $TAG via top-level version file"
 echo "$TAG" > "$REPO_ROOT/version"
 
+# make defconfig silently drops any CONFIG_PACKAGE_ symbol it does not
+# recognise, and everything outside package/ -- tailscale, curl, wget-ssl,
+# ca-certificates, e2fsprogs, blkid, ip-full -- lives in the packages feed.
+# Without this the .config written below is quietly reduced to the handful of
+# kmods that ship in-tree, which is how a firmware with no NVMe driver and no
+# spidev got built and shipped before.
+step "Updating and installing package feeds"
+mkdir -p tmp
+./scripts/feeds update -a
+./scripts/feeds install -a
+
+# The MCP2515 hangs off the mikroBUS SPI bus, which the stock OpenWRT One DTS
+# brings up with no child node -- so nothing binds to it and no /dev/spidev
+# ever appears. Three edits make it reachable from userspace:
+#
+#   - UART2 is disabled: its pins collide with SPI1.
+#   - The mikrobus-reset gpio-export is dropped, so the controller's userspace
+#     driver can own the reset line itself.
+#   - A spidev@0 node is added under &spi1. It is declared as silabs,si3210
+#     because the kernel spidev driver binds only to the parts listed in
+#     spidev_dt_ids and explicitly rejects a generic "spidev" compatible.
+#     See OpenWRT PR #17399.
+#
+# The result is verified below rather than assumed: these are regex edits
+# against an upstream file, and a pattern that silently matched nothing would
+# otherwise yield firmware with no CAN access and no error anywhere in the log.
+step "Patching the OpenWRT One DTS for userspace SPI access"
+DTS="target/linux/mediatek/dts/mt7981b-openwrt-one.dts"
+if [ ! -f "$DTS" ]; then
+    echo "ERROR: DTS not found: $DTS" >&2
+    exit 1
+fi
+python3 - "$DTS" "$TAG" <<'PY'
+import re, sys
+from pathlib import Path
+
+path, tag = Path(sys.argv[1]), sys.argv[2]
+text = path.read_text()
+
+text = re.sub(r'(&uart2\s*\{[^{}]*?status\s*=\s*")okay(";)',
+              r'\1disabled\2', text, flags=re.S)
+text = re.sub(r'(gpio-export\s*\{[^{}]*)gpio-0\s*\{[^{}]*?\};',
+              r'\1', text, flags=re.S)
+text = re.sub(r'(&spi1\s*\{[^}]*)(status\s*=\s*"okay";\s*)(\};)',
+              r'''\1\2
+	spidev@0 {
+		compatible = "silabs,si3210";
+		reg = <0>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		spi-max-frequency = <52000000>;
+	};
+\3''', text, flags=re.S)
+
+path.write_text(text)
+
+problems = []
+if "spidev@0" not in text:
+    problems.append("spidev@0 node was not added under &spi1")
+if "silabs,si3210" not in text:
+    problems.append("spidev compatible string is missing")
+if "mikrobus-reset" in text:
+    problems.append("mikrobus-reset gpio-export was not removed")
+if re.search(r'&uart2\s*\{[^{}]*?status\s*=\s*"okay"', text, flags=re.S):
+    problems.append("uart2 is still enabled and will collide with SPI1")
+
+if problems:
+    sys.stderr.write("ERROR: DTS patch did not apply cleanly to %s:\n" % tag)
+    for problem in problems:
+        sys.stderr.write("  - %s\n" % problem)
+    sys.stderr.write("  The upstream DTS likely changed shape in this release.\n")
+    raise SystemExit(1)
+
+print("Verified: spidev@0 added, mikrobus-reset removed, uart2 disabled")
+PY
+
 step "Writing .config for OpenWRT One (mediatek/filogic)"
 cat > .config <<'EOF'
 CONFIG_TARGET_mediatek=y
 CONFIG_TARGET_mediatek_filogic=y
 CONFIG_TARGET_mediatek_filogic_DEVICE_openwrt_one=y
+
+# Userspace SPI. The controller drives the MCP2515 itself over
+# /dev/spidev2.0 rather than through the kernel CAN stack, so this is what
+# makes the CAN module reachable at all. Without it there is no device node.
+CONFIG_PACKAGE_kmod-spi-dev=y
+
+# The SSD. /solarmatrix lives there, so without kmod-nvme the disk is
+# invisible and nothing the device stores survives a reboot. ext4 is the only
+# filesystem involved: the provisioning tool formats the partition ext4 and
+# mounts it, and nothing on the device reads any other kind.
+CONFIG_PACKAGE_kmod-nvme=y
+CONFIG_PACKAGE_kmod-fs-ext4=y
+
+# Disk preparation, used by the provisioning tool over SSH: it runs
+# "parted mklabel gpt", "parted mkpart primary ext4" and then "mkfs.ext4".
+# BusyBox has no parted, and mkfs.ext4 comes from e2fsprogs.
+CONFIG_PACKAGE_parted=y
+CONFIG_PACKAGE_e2fsprogs=y
+
+# blkid identifies the NVMe partition; all three of the on-device storage
+# scripts in solarmatrix/files call it.
+CONFIG_PACKAGE_blkid=y
+
+# curl is run on the device by the provisioning tool's verification step,
+# "curl -f -s -o /dev/null http://127.0.0.1/", to prove the controller is
+# serving before the run is allowed to succeed.
+CONFIG_PACKAGE_curl=y
+
+# Public trust roots. The relay client pins RootCAs to the device's own
+# ca.crt and needs none of these, but the clone report in
+# internal/relay/clone.go sets no RootCAs at all, so it falls back to the
+# system pool to reach api.solarmatrix.eu. Without this that call fails with
+# an unknown-authority error.
+CONFIG_PACKAGE_ca-certificates=y
 EOF
 make defconfig
+
+# defconfig drops unknown symbols without comment, so confirm the packages that
+# make this device work are actually selected. A missing kmod-nvme means the SSD
+# never appears and /solarmatrix cannot mount; a missing kmod-spi-dev means
+# /dev/spidev2.0 never appears and the CAN module is unreachable. Both have
+# shipped before, and neither produced an error at build time.
+step "Verifying requested packages survived defconfig"
+MISSING_PKGS=""
+for PKG in kmod-spi-dev kmod-nvme kmod-fs-ext4 parted e2fsprogs \
+           blkid curl ca-certificates; do
+    if ! grep -q "^CONFIG_PACKAGE_$PKG=y\$" .config; then
+        MISSING_PKGS="$MISSING_PKGS $PKG"
+    fi
+done
+if [ -n "$MISSING_PKGS" ]; then
+    echo "ERROR: defconfig dropped these packages:$MISSING_PKGS" >&2
+    echo "  They are not selectable in this tree -- are the feeds installed?" >&2
+    exit 1
+fi
+echo "Verified: all 8 requested packages are selected"
 
 step "Building (this is slow)"
 make -j"$(nproc)" V=s
@@ -162,7 +302,14 @@ if [ -z "$ROOTFS_DIR" ]; then
     echo "ERROR: no rootfs staging directory under build_dir" >&2
     exit 1
 fi
-for OVERLAY_FILE in etc/uci-defaults/99-solarmatrix-hardening sbin/solarmatrix-harden-ssh; do
+for OVERLAY_FILE in \
+    etc/uci-defaults/99-solarmatrix-hardening \
+    sbin/solarmatrix-harden-ssh \
+    etc/hotplug.d/block/20-solarmatrix-nvme \
+    etc/init.d/solarmatrix-mount \
+    etc/init.d/solarmatrix \
+    usr/sbin/solarmatrix-storage \
+; do
     if ! cmp -s "$REPO_ROOT/solarmatrix/files/$OVERLAY_FILE" "$ROOTFS_DIR/$OVERLAY_FILE"; then
         echo "ERROR: $OVERLAY_FILE does not match solarmatrix/files/ in the rootfs" >&2
         echo "  Expected: $REPO_ROOT/solarmatrix/files/$OVERLAY_FILE" >&2

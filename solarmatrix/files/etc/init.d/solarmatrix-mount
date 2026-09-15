@@ -1,0 +1,105 @@
+#!/bin/sh /etc/rc.common
+
+# SolarMatrix NVMe Mount Service
+
+START=20
+STOP=90
+
+USE_PROCD=1
+
+MOUNT_POINT="/solarmatrix"
+LOGFILE="/tmp/solarmatrix-mount.log"
+
+log_msg() {
+    echo "$(date '+%a %b %d %H:%M:%S %Y'): $*" >> "${LOGFILE}"
+}
+
+mount_nvme() {
+    log_msg "SolarMatrix mount service starting..."
+    
+    # Create mount point if needed
+    [ -d "${MOUNT_POINT}" ] || mkdir -p "${MOUNT_POINT}"
+    
+    # Check if already mounted
+    if mount | grep -q " ${MOUNT_POINT} "; then
+        log_msg "Mount point already in use"
+        return 0
+    fi
+    
+    # Find NVMe devices
+    for device in /dev/nvme*n*p* /dev/nvme*n*; do
+        [ -b "${device}" ] || continue
+        
+        # Skip if it's a partition designator but not an actual partition
+        case "${device}" in
+            *n*p*) ;; # partition
+            *n*) [ ! -e "${device}p1" ] || continue ;; # has partitions, skip base device
+        esac
+        
+        # Check filesystem - try multiple methods
+        FS_TYPE=$(blkid -s TYPE -o value "${device}" 2>/dev/null || \
+                  block info "${device}" 2>/dev/null | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || \
+                  echo "")
+        
+        if [ -z "${FS_TYPE}" ]; then
+            # Fallback: try to mount with common filesystems
+            log_msg "No filesystem detected on ${device}, trying auto-probe..."
+            for try_fs in ext4 xfs btrfs f2fs; do
+                if mount -t "${try_fs}" -o ro "${device}" "${MOUNT_POINT}" 2>/dev/null; then
+                    FS_TYPE="${try_fs}"
+                    umount "${MOUNT_POINT}" 2>/dev/null
+                    log_msg "Probed filesystem: ${FS_TYPE} on ${device}"
+                    break
+                fi
+            done
+        fi
+        
+        if [ -z "${FS_TYPE}" ]; then
+            log_msg "No supported filesystem found on ${device}"
+            continue
+        fi
+        
+        log_msg "Found supported filesystem ${FS_TYPE} on ${device}"
+        
+        # Try to mount
+        if mount -t "${FS_TYPE}" "${device}" "${MOUNT_POINT}"; then
+            log_msg "Successfully mounted ${device} (${FS_TYPE}) to ${MOUNT_POINT}"
+            
+            # Create directory structure
+            mkdir -p "${MOUNT_POINT}/config" "${MOUNT_POINT}/data" "${MOUNT_POINT}/logs"
+            chmod 755 "${MOUNT_POINT}" "${MOUNT_POINT}/config" "${MOUNT_POINT}/data" "${MOUNT_POINT}/logs"
+            
+            # Create marker
+            echo "Auto-mounted by SolarMatrix on $(date)" > "${MOUNT_POINT}/.solarmatrix-mount"
+            
+            log_msg "Boot-time mount completed"
+            return 0
+        else
+            log_msg "Failed to mount ${device}"
+        fi
+    done
+    
+    log_msg "No suitable NVMe device found for mounting"
+}
+
+unmount_nvme() {
+    log_msg "SolarMatrix mount service stopping..."
+    
+    if mount | grep -q " ${MOUNT_POINT} "; then
+        umount "${MOUNT_POINT}" && log_msg "Unmounted ${MOUNT_POINT}" || log_msg "Failed to unmount ${MOUNT_POINT}"
+    fi
+}
+
+start_service() {
+    mount_nvme
+}
+
+stop_service() {
+    unmount_nvme
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
