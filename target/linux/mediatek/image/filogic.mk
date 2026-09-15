@@ -316,7 +316,7 @@ endef
 define Device/smartrg_sdg-8612
 $(call Device/adtran_smartrg)
   DEVICE_MODEL := SDG-8612
-  DEVICE_DTS := mt7986a-smartrg-SDG-8612
+  DEVICE_DTS := mt7986a-smartrg-sdg-8612
   DEVICE_PACKAGES += kmod-mt7915e kmod-mt7986-firmware mt7986-wo-firmware
 endef
 TARGET_DEVICES += smartrg_sdg-8612
@@ -324,7 +324,7 @@ TARGET_DEVICES += smartrg_sdg-8612
 define Device/smartrg_sdg-8614
 $(call Device/adtran_smartrg)
   DEVICE_MODEL := SDG-8614
-  DEVICE_DTS := mt7986a-smartrg-SDG-8614
+  DEVICE_DTS := mt7986a-smartrg-sdg-8614
   DEVICE_PACKAGES += kmod-mt7915e kmod-mt7986-firmware mt7986-wo-firmware
 endef
 TARGET_DEVICES += smartrg_sdg-8614
@@ -332,7 +332,7 @@ TARGET_DEVICES += smartrg_sdg-8614
 define Device/smartrg_sdg-8622
 $(call Device/adtran_smartrg)
   DEVICE_MODEL := SDG-8622
-  DEVICE_DTS := mt7986a-smartrg-SDG-8622
+  DEVICE_DTS := mt7986a-smartrg-sdg-8622
   DEVICE_PACKAGES += kmod-mt7915e kmod-mt7915-firmware kmod-mt7986-firmware mt7986-wo-firmware
 endef
 TARGET_DEVICES += smartrg_sdg-8622
@@ -340,15 +340,33 @@ TARGET_DEVICES += smartrg_sdg-8622
 define Device/smartrg_sdg-8632
 $(call Device/adtran_smartrg)
   DEVICE_MODEL := SDG-8632
-  DEVICE_DTS := mt7986a-smartrg-SDG-8632
+  DEVICE_DTS := mt7986a-smartrg-sdg-8632
   DEVICE_PACKAGES += kmod-mt7915e kmod-mt7915-firmware kmod-mt7986-firmware mt7986-wo-firmware
 endef
 TARGET_DEVICES += smartrg_sdg-8632
 
+define Device/smartrg_sdg-8712
+$(call Device/adtran_smartrg)
+  DEVICE_MODEL := SDG-8712
+  DEVICE_DTS := mt7987a-smartrg-sdg-8712
+  KERNEL_LOADADDR := 0x43200000
+  DEVICE_PACKAGES += kmod-mt7992-firmware kmod-phy-maxlinear kmod-usb3 mt7987-2p5g-phy-firmware
+endef
+TARGET_DEVICES += smartrg_sdg-8712
+
+define Device/smartrg_sdg-8732
+$(call Device/adtran_smartrg)
+  DEVICE_MODEL := SDG-8732
+  DEVICE_DTS := mt7987a-smartrg-sdg-8732
+  KERNEL_LOADADDR := 0x43200000
+  DEVICE_PACKAGES += kmod-mt7996-233-firmware kmod-phy-maxlinear kmod-usb3 mt7987-2p5g-phy-firmware
+endef
+TARGET_DEVICES += smartrg_sdg-8732
+
 define Device/smartrg_sdg-8733
 $(call Device/adtran_smartrg)
   DEVICE_MODEL := SDG-8733
-  DEVICE_DTS := mt7988a-smartrg-SDG-8733
+  DEVICE_DTS := mt7988a-smartrg-sdg-8733
   DEVICE_PACKAGES += kmod-mt7996-firmware kmod-phy-aquantia kmod-usb3 mt7988-wo-firmware
 endef
 TARGET_DEVICES += smartrg_sdg-8733
@@ -356,7 +374,7 @@ TARGET_DEVICES += smartrg_sdg-8733
 define Device/smartrg_sdg-8733a
 $(call Device/adtran_smartrg)
   DEVICE_MODEL := SDG-8733A
-  DEVICE_DTS := mt7988d-smartrg-SDG-8733A
+  DEVICE_DTS := mt7988d-smartrg-sdg-8733a
   DEVICE_PACKAGES += mt7988-2p5g-phy-firmware kmod-mt7996-233-firmware kmod-phy-aquantia mt7988-wo-firmware
 endef
 TARGET_DEVICES += smartrg_sdg-8733a
@@ -364,7 +382,7 @@ TARGET_DEVICES += smartrg_sdg-8733a
 define Device/smartrg_sdg-8734
 $(call Device/adtran_smartrg)
   DEVICE_MODEL := SDG-8734
-  DEVICE_DTS := mt7988a-smartrg-SDG-8734
+  DEVICE_DTS := mt7988a-smartrg-sdg-8734
   DEVICE_PACKAGES += kmod-mt7996-firmware kmod-phy-aquantia kmod-sfp kmod-usb3 mt7988-wo-firmware
 endef
 TARGET_DEVICES += smartrg_sdg-8734
@@ -1008,12 +1026,15 @@ define Device/cmcc_rax3000m
   DEVICE_ALT0_VENDOR := CMCC
   DEVICE_ALT0_MODEL := RAX3000Me
   DEVICE_DTS := mt7981b-cmcc-rax3000m
-  DEVICE_DTS_OVERLAY := mt7981b-cmcc-rax3000m-emmc mt7981b-cmcc-rax3000m-nand
+  DEVICE_DTS_OVERLAY := mt7981b-cmcc-rax3000m-emmc mt7981b-cmcc-rax3000m-nand mt7981b-cmcc-rax3000m-ubi
   DEVICE_DTS_DIR := ../dts
   DEVICE_DTC_FLAGS := --pad 4096
   DEVICE_DTS_LOADADDR := 0x43f00000
   DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3 \
 	e2fsprogs f2fsck mkf2fs
+  DEVICE_COMPAT_VERSION := 1.1
+  DEVICE_COMPAT_MESSAGE := WAN port renamed from eth1 to wan to match its physical \
+	label, check wan interface configuration after upgrade.
   KERNEL_LOADADDR := 0x44000000
   KERNEL := kernel-bin | gzip
   KERNEL_INITRAMFS := kernel-bin | lzma | \
@@ -1030,7 +1051,9 @@ define Device/cmcc_rax3000m
 	emmc-ddr3-bl31-uboot.fip emmc-ddr3-preloader.bin \
 	emmc-ddr4-bl31-uboot.fip emmc-ddr4-preloader.bin \
 	nand-ddr3-bl31-uboot.fip nand-ddr3-preloader.bin \
-	nand-ddr4-bl31-uboot.fip nand-ddr4-preloader.bin
+	nand-ddr4-bl31-uboot.fip nand-ddr4-preloader.bin \
+	ubi-ddr3-bl31-uboot.fip ubi-ddr3-preloader.bin \
+	ubi-ddr4-bl31-uboot.fip ubi-ddr4-preloader.bin
   ARTIFACT/emmc-gpt.bin := mt798x-gpt emmc
   ARTIFACT/emmc-ddr3-bl31-uboot.fip := mt7981-bl31-uboot cmcc_rax3000m-emmc-ddr3
   ARTIFACT/emmc-ddr3-preloader.bin  := mt7981-bl2 emmc-ddr3-1866
@@ -1040,6 +1063,10 @@ define Device/cmcc_rax3000m
   ARTIFACT/nand-ddr3-preloader.bin  := mt7981-bl2 spim-nand-ddr3-1866
   ARTIFACT/nand-ddr4-bl31-uboot.fip := mt7981-bl31-uboot cmcc_rax3000m-nand-ddr4
   ARTIFACT/nand-ddr4-preloader.bin  := mt7981-bl2 spim-nand-ddr4
+  ARTIFACT/ubi-ddr3-bl31-uboot.fip := mt7981-bl31-uboot cmcc_rax3000m-ubi-ddr3
+  ARTIFACT/ubi-ddr3-preloader.bin  := mt7981-bl2 spim-nand-ubi-ddr3-1866
+  ARTIFACT/ubi-ddr4-bl31-uboot.fip := mt7981-bl31-uboot cmcc_rax3000m-ubi-ddr4
+  ARTIFACT/ubi-ddr4-preloader.bin  := mt7981-bl2 spim-nand-ubi-ddr4
 endef
 TARGET_DEVICES += cmcc_rax3000m
 
@@ -2273,7 +2300,7 @@ define Device/jiorouter_ax6000-jidu6101
   DEVICE_VARIANT := JIDU6101
   DEVICE_DTS := mt7986a-jiorouter-ax6000-jidu6101
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-usb3 kmod-mt7915e kmod-mt7916-firmware kmod-mt7986-firmware mt7986-wo-firmware
+  DEVICE_PACKAGES := kmod-usb3 kmod-mt7915e kmod-mt7986-firmware mt7986-wo-firmware
   UBINIZE_OPTS := -E 5
   UBOOTENV_IN_UBI := 1
   BLOCKSIZE := 128k
@@ -2281,6 +2308,33 @@ define Device/jiorouter_ax6000-jidu6101
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
 TARGET_DEVICES += jiorouter_ax6000-jidu6101
+
+define Device/jiorouter_ax6000-jidu6j01
+  DEVICE_VENDOR := JioRouter
+  DEVICE_MODEL := AX6000
+  DEVICE_VARIANT := JIDU6J01
+  DEVICE_ALT0_VENDOR := JioRouter
+  DEVICE_ALT0_MODEL := AX6000
+  DEVICE_ALT0_VARIANT := JIDU6201
+  DEVICE_ALT1_VENDOR := JioRouter
+  DEVICE_ALT1_MODEL := AX6000
+  DEVICE_ALT1_VARIANT := JIDU6401
+  DEVICE_ALT2_VENDOR := JioRouter
+  DEVICE_ALT2_MODEL := AX6000
+  DEVICE_ALT2_VARIANT := JIDU6601
+  DEVICE_ALT3_VENDOR := JioRouter
+  DEVICE_ALT3_MODEL := AX6000
+  DEVICE_ALT3_VARIANT := JIDU6701
+  DEVICE_DTS := mt7986a-jiorouter-ax6000-jidu6j01
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_PACKAGES := kmod-usb3 kmod-mt7915e kmod-mt7986-firmware mt7986-wo-firmware
+  UBINIZE_OPTS := -E 5
+  UBOOTENV_IN_UBI := 1
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += jiorouter_ax6000-jidu6j01
 
 define Device/kebidumei_ax3000-u22
   DEVICE_VENDOR := Kebidumei
@@ -3986,6 +4040,24 @@ define Device/zbtlink_zbt-z8103ax-c
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
 TARGET_DEVICES += zbtlink_zbt-z8103ax-c
+
+define Device/zbtlink_zbt-z8105ax-c
+  DEVICE_VENDOR := Zbtlink
+  DEVICE_MODEL := ZBT-Z8105AX-C
+  SUPPORTED_DEVICES += zbtlink,z8105ax-2sim
+  DEVICE_DTS := mt7981b-zbtlink-zbt-z8105ax-c
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3 kmod-usb-net-qmi-wwan kmod-usb-serial-option
+  KERNEL_IN_UBI := 1
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE_SIZE := 65536k
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-ubi | check-size $$(IMAGE_SIZE)
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += zbtlink_zbt-z8105ax-c
 
 define Device/zbtlink_zbt-z8106ax-s
   DEVICE_VENDOR := Zbtlink

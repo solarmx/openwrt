@@ -2,6 +2,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_VERSION:=2026.07
+PKG_RELEASE:=1
 PKG_HASH:=78e8bfc382fe388f9b55aa1daf8c563522a037779b5d4c349d1415e381f1243e
 PKG_BUILD_DEPENDS:=!(TARGET_ramips||TARGET_mediatek_mt7623):arm-trusted-firmware-tools/host
 
@@ -303,6 +304,30 @@ define U-Boot/mt7981_cmcc_rax3000m-nand-ddr4
   BL2_SOC:=mt7981
   BL2_DDRTYPE:=ddr4
   DEPENDS:=+trusted-firmware-a-mt7981-spim-nand-ddr4
+endef
+
+define U-Boot/mt7981_cmcc_rax3000m-ubi-ddr3
+  NAME:=CMCC RAX3000M (DDR3, UBI)
+  BUILD_SUBTARGET:=filogic
+  BUILD_DEVICES:=cmcc_rax3000m
+  UBOOT_CONFIG:=mt7981_cmcc_rax3000m-ubi
+  UBOOT_IMAGE:=u-boot.fip
+  BL2_BOOTDEV:=spim-nand-ubi
+  BL2_SOC:=mt7981
+  BL2_DDRTYPE:=ddr3-1866
+  DEPENDS:=+trusted-firmware-a-mt7981-spim-nand-ubi-ddr3-1866
+endef
+
+define U-Boot/mt7981_cmcc_rax3000m-ubi-ddr4
+  NAME:=CMCC RAX3000M (DDR4, UBI)
+  BUILD_SUBTARGET:=filogic
+  BUILD_DEVICES:=cmcc_rax3000m
+  UBOOT_CONFIG:=mt7981_cmcc_rax3000m-ubi
+  UBOOT_IMAGE:=u-boot.fip
+  BL2_BOOTDEV:=spim-nand-ubi
+  BL2_SOC:=mt7981
+  BL2_DDRTYPE:=ddr4
+  DEPENDS:=+trusted-firmware-a-mt7981-spim-nand-ubi-ddr4
 endef
 
 define U-Boot/mt7981_comfast_cf-wr632ax
@@ -1378,6 +1403,8 @@ UBOOT_TARGETS := \
 	mt7981_cmcc_rax3000m-emmc-ddr4 \
 	mt7981_cmcc_rax3000m-nand-ddr3 \
 	mt7981_cmcc_rax3000m-nand-ddr4 \
+	mt7981_cmcc_rax3000m-ubi-ddr3 \
+	mt7981_cmcc_rax3000m-ubi-ddr4 \
 	mt7981_comfast_cf-wr632ax \
 	mt7981_comfast_cf-wr632ax-ubi \
 	mt7981_creatlentem_clt-r30b1-ubi \
