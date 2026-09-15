@@ -130,30 +130,25 @@ if [ -d build_dir ]; then
         -delete
 fi
 
-# OpenWRT's scripts/getver.sh checks $TOPDIR/version before its
-# commit-counting fallback. Pinning it fixes version.buildinfo and
-# DISTRIB_RELEASE in /etc/openwrt_release.
+# The release version number is CONFIG_VERSION_NUMBER. It is what ends up in
+# DISTRIB_RELEASE in /etc/openwrt_release, and it is the number a person means
+# by "which OpenWRT is this".
 #
-# The leading "v" is stripped, because this is a version number and not a git
-# ref. base-files builds its own package version as PKG_RELEASE~VERSION_NUMBER,
-# and apk -- which replaced opkg as the package manager in this release series
-# -- refuses a version that does not begin with a digit:
+# It is deliberately NOT written to the top-level "version" file. That file
+# feeds scripts/getver.sh, which sets REVISION -- a different thing, meant to
+# look like r28790-abc123def. base-files composes its own package version from
+# it as PKG_RELEASE~<last dash-separated field of REVISION>, normally a git
+# hash. Pinning REVISION to a release number puts dots there, and apk rejects
+# the result:
 #
-#   apk mkpkg --info "version:1711~v25.12.5"
+#   apk mkpkg --info "version:1711~25.12.5"
 #   ERROR: info field 'version' has invalid value: package version is invalid
 #
-# That fails the whole build at package/base-files. Upstream releases set this
-# to 25.12.5 for the tag v25.12.5, and this now matches them.
+# apk accepts 1711~abc123de and 1711~25125 but not 1711~25.12.5, so a dotted
+# REVISION fails the build at package/base-files. REVISION is therefore left
+# to git, which is reproducible anyway because a fixed tag is checked out.
 VERSION_NUMBER="${TAG#v}"
-step "Pinning version.buildinfo to $VERSION_NUMBER via top-level version file"
-echo "$VERSION_NUMBER" > "$REPO_ROOT/version"
 
-# make defconfig silently drops any CONFIG_PACKAGE_ symbol it does not
-# recognise, and everything outside package/ -- tailscale, curl, wget-ssl,
-# ca-certificates, e2fsprogs, blkid, ip-full -- lives in the packages feed.
-# Without this the .config written below is quietly reduced to the handful of
-# kmods that ship in-tree, which is how a firmware with no NVMe driver and no
-# spidev got built and shipped before.
 step "Updating and installing package feeds"
 mkdir -p tmp
 ./scripts/feeds update -a
@@ -264,6 +259,10 @@ CONFIG_PACKAGE_curl=y
 # an unknown-authority error.
 CONFIG_PACKAGE_ca-certificates=y
 EOF
+
+# Appended rather than placed in the heredoc above, which is quoted so that
+# nothing else in it is expanded.
+printf 'CONFIG_VERSION_NUMBER="%s"\n' "$VERSION_NUMBER" >> .config
 make defconfig
 
 # defconfig drops unknown symbols without comment, so confirm the packages that
@@ -286,22 +285,33 @@ if [ -n "$MISSING_PKGS" ]; then
 fi
 echo "Verified: all 8 requested packages are selected"
 
+if ! grep -q "^CONFIG_VERSION_NUMBER=\"$VERSION_NUMBER\"\$" .config; then
+    echo "ERROR: defconfig dropped CONFIG_VERSION_NUMBER=\"$VERSION_NUMBER\"" >&2
+    echo "  Images would be built as SNAPSHOT rather than as this release." >&2
+    exit 1
+fi
+echo "Verified: release version is $VERSION_NUMBER"
+
 step "Building (this is slow)"
 make -j"$(nproc)" V=s
 
-step "Verifying version.buildinfo matches $VERSION_NUMBER"
-BUILDINFO_FILE="$(find bin/targets -maxdepth 4 -name 'version.buildinfo' | head -1)"
-if [ -z "$BUILDINFO_FILE" ]; then
-    echo "ERROR: no version.buildinfo emitted by build" >&2
+# version.buildinfo now carries the git revision, which is the correct thing
+# for it to carry. What matters to a person holding the device is
+# DISTRIB_RELEASE, so check that instead -- and check it in the rootfs that
+# was actually staged, not in a build variable.
+step "Verifying the release version reached the rootfs"
+ROOTFS_DIR="$(find build_dir -maxdepth 2 -type d -name 'root-*' | head -1)"
+if [ -z "$ROOTFS_DIR" ]; then
+    echo "ERROR: no rootfs staging directory under build_dir" >&2
     exit 1
 fi
-ACTUAL="$(cat "$BUILDINFO_FILE")"
-if [ "$ACTUAL" != "$VERSION_NUMBER" ]; then
-    echo "ERROR: version.buildinfo='$ACTUAL', expected '$VERSION_NUMBER'" >&2
-    echo "  $BUILDINFO_FILE" >&2
-    echo "  Did the version file override fail?" >&2
+RELEASE_FILE="$ROOTFS_DIR/etc/openwrt_release"
+if ! grep -q "^DISTRIB_RELEASE='$VERSION_NUMBER'\$" "$RELEASE_FILE" 2>/dev/null; then
+    echo "ERROR: $RELEASE_FILE does not report DISTRIB_RELEASE='$VERSION_NUMBER'" >&2
+    grep '^DISTRIB_RELEASE=' "$RELEASE_FILE" 2>/dev/null >&2 || echo "  (no DISTRIB_RELEASE line)" >&2
     exit 1
 fi
+echo "Verified: DISTRIB_RELEASE='$VERSION_NUMBER'"
 
 # A hardening script that silently failed to reach the rootfs would ship a
 # device that answers a root password on the LAN, so make it a build failure
