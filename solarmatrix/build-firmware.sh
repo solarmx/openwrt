@@ -263,9 +263,15 @@ EOF
 # Appended rather than placed in the heredoc above, which is quoted so that
 # nothing else in it is expanded.
 #
-# CONFIG_VERSION_NUMBER sits inside "menuconfig VERSIONOPT" / "if VERSIONOPT"
-# in package/base-files/image-config.in, so the gate has to be set too --
-# otherwise defconfig drops the version and the image is built as SNAPSHOT.
+# CONFIG_VERSION_NUMBER sits inside "menuconfig VERSIONOPT", whose own prompt
+# exists only "if IMAGEOPT", so both gates are needed. Without them defconfig
+# drops the version silently and the image is built as SNAPSHOT. Established
+# by testing defconfig directly rather than by reading Kconfig:
+#
+#   VERSION_NUMBER alone        -> dropped
+#   + CONFIG_VERSIONOPT=y       -> dropped
+#   + CONFIG_IMAGEOPT=y as well -> kept
+printf 'CONFIG_IMAGEOPT=y\n' >> .config
 printf 'CONFIG_VERSIONOPT=y\n' >> .config
 printf 'CONFIG_VERSION_NUMBER="%s"\n' "$VERSION_NUMBER" >> .config
 make defconfig
