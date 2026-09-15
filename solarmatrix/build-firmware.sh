@@ -262,6 +262,11 @@ EOF
 
 # Appended rather than placed in the heredoc above, which is quoted so that
 # nothing else in it is expanded.
+#
+# CONFIG_VERSION_NUMBER sits inside "menuconfig VERSIONOPT" / "if VERSIONOPT"
+# in package/base-files/image-config.in, so the gate has to be set too --
+# otherwise defconfig drops the version and the image is built as SNAPSHOT.
+printf 'CONFIG_VERSIONOPT=y\n' >> .config
 printf 'CONFIG_VERSION_NUMBER="%s"\n' "$VERSION_NUMBER" >> .config
 make defconfig
 
