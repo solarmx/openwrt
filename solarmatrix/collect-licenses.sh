@@ -264,9 +264,14 @@ for ENTRY in "${NOTICES[@]}"; do
     OV_LIC="$OVERRIDE_DIR/$NAME.license"
     if [ -f "$OV_TXT" ] && [ -f "$OV_LIC" ]; then
         OV_LIC_ID=$(head -n1 "$OV_LIC" | tr -d '\r\n' | awk '{$1=$1};1')
-        ENTRY=$(jq -cn --arg l "$OV_LIC_ID" --rawfile t "$OV_TXT" \
-            --argjson base "$ENTRY" \
-            '$base | .license=$l | .text=$t')
+        # The base entry goes in on stdin rather than through --argjson.
+        # Linux caps a single argv element at 128 KB independently of the
+        # total ARG_MAX, and an entry carrying a full licence text passes it:
+        # the LGPL-2.1 override alone is 26 KB before JSON escaping, and
+        # exec fails with "Argument list too long". Same reason the manifest
+        # assembly below uses --slurpfile.
+        ENTRY=$(printf '%s' "$ENTRY" | jq -c --arg l "$OV_LIC_ID" --rawfile t "$OV_TXT" \
+            '.license=$l | .text=$t')
     elif [ -f "$OV_TXT" ] && [ ! -f "$OV_LIC" ]; then
         echo "collect-licenses.sh: $NAME: found $OV_TXT but missing $OV_LIC" >&2
         exit 1
