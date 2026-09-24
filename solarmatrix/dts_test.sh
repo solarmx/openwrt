@@ -120,28 +120,46 @@ source_fails "case 13" "$T/x.dts" '/delete-property/ read-only'
 
 # --- Case 14: a path override elsewhere in the file (b3) ---
 cp "$T/patched.dts" "$T/x.dts"
-printf '\n&{/soc/spi@1100b000/flash@0/partitions/partition@40000} {\n\t/delete-property/ read-only;\n};\n' >> "$T/x.dts"
-source_fails "case 14" "$T/x.dts" 'path reference &{/soc/spi@1100b000/flash@0/partitions/partition@40000}'
+printf '\n&{/soc/spi@11009000/flash@0/partitions/partition@40000} {\n\t/delete-property/ read-only;\n};\n' >> "$T/x.dts"
+source_fails "case 14" "$T/x.dts" 'path reference &{/soc/spi@11009000/flash@0/partitions/partition@40000}'
 
 # --- Case 15: a label override of a factory nvmem cell ---
 cp "$T/patched.dts" "$T/x.dts"
 printf '\n&macaddr_factory_4 {\n\treg = <0x2000 0x6>;\n};\n' >> "$T/x.dts"
 source_fails "case 15" "$T/x.dts" '&macaddr_factory_4 overrides a node of the NOR table'
 
-# --- DTB checks: the patched flash node, compiled on its own by dtc ---
-# wrap_flash IN OUT [EXTRA]: a minimal tree holding IN's &spi2 flash@0 node at
-# the path the real SoC has (the controller labelled spi2), followed by EXTRA.
+# --- DTB checks: the patched flash nodes, compiled on their own by dtc ---
+# flash_block IN CTRL: IN's flash@0 node under &CTRL, as text.
+flash_block() {
+    awk -v ctrl="$2" '$0 == "&" ctrl " {" {s=1} s && /^\tflash@0 \{/{f=1} f{print} f && /^\t\};/{exit}' "$1"
+}
+# wrap_tree NORFILE OUT [EXTRA]: a minimal tree laid out like the real SoC
+# (mt7981b.dtsi via patches-6.12/117-complete-mt7981b-dtsi.patch): NORFILE's
+# flash nodes on spi2 = spi@11009000, the fork's NAND flash on spi0 =
+# spi@1100a000, the mikroBUS spidev on spi1 = spi@1100b000, then EXTRA.
 # DTC_FLAGS=-@ adds __symbols__, as an overlay-capable build does.
-wrap_flash() {
+wrap_tree() {
     {
-        printf '/dts-v1/;\n/ {\n\tsoc {\n\t\t#address-cells = <1>;\n\t\t#size-cells = <1>;\n'
-        printf '\t\tspi2: spi@1100b000 {\n\t\t\treg = <0x1100b000 0x100>;\n\t\t\t#address-cells = <1>;\n\t\t\t#size-cells = <0>;\n'
-        awk '/^&spi2 \{/{s=1} s && /^\tflash@0 \{/{f=1} f{print} f && /^\t\};/{exit}' "$1"
-        printf '\t\t};\n\t};\n};\n%s\n' "${3:-}"
+        printf '/dts-v1/;\n/ {\n\t#address-cells = <2>;\n\t#size-cells = <2>;\n'
+        printf '\tsoc {\n\t\t#address-cells = <2>;\n\t\t#size-cells = <2>;\n'
+        printf '\t\tspi2: spi@11009000 {\n\t\t\treg = <0 0x11009000 0 0x1000>;\n\t\t\t#address-cells = <1>;\n\t\t\t#size-cells = <0>;\n'
+        cat "$1"
+        printf '\t\t};\n'
+        printf '\t\tspi0: spi@1100a000 {\n\t\t\treg = <0 0x1100a000 0 0x1000>;\n\t\t\t#address-cells = <1>;\n\t\t\t#size-cells = <0>;\n'
+        flash_block "$T/pristine.dts" spi0 | sed 's/^\([[:space:]]*\)[A-Za-z_][A-Za-z_0-9]*: /\1/'
+        printf '\t\t};\n'
+        printf '\t\tspi1: spi@1100b000 {\n\t\t\treg = <0 0x1100b000 0 0x1000>;\n\t\t\t#address-cells = <1>;\n\t\t\t#size-cells = <0>;\n'
+        printf '\t\t\tspidev@0 { compatible = "silabs,si3210"; reg = <0>; };\n\t\t};\n'
+        printf '\t};\n};\n%s\n' "${3:-}"
     } > "$T/wrap.dts"
     local flags=()
     [ -z "${DTC_FLAGS:-}" ] || flags=("$DTC_FLAGS")
     dtc -q ${flags[@]+"${flags[@]}"} -I dts -O dtb -o "$2" "$T/wrap.dts"
+}
+# wrap_flash IN OUT [EXTRA]: wrap_tree with IN's NOR flash.
+wrap_flash() {
+    flash_block "$1" spi2 > "$T/nor.txt"
+    wrap_tree "$T/nor.txt" "$2" "${3:-}"
 }
 
 dtb_fails() {
@@ -151,22 +169,24 @@ dtb_fails() {
     assert_contains "$3" "$OUT" "$1: names the problem"
 }
 
-# --- Case 16: the compiled patched table passes ---
+# --- Case 16: the compiled patched table passes; no __symbols__, the NAND
+# table on spi0 is allowed, and spi@1100b000 carrying spidev is not the NOR ---
 CASES=$((CASES + 1))
 wrap_flash "$T/patched.dts" "$T/good.dtb"
 run check-dtb "$T/good.dtb"
 assert_eq 0 "$RC" "case 16: compiled table passes ($OUT)"
+assert_not_contains "__symbols__" "$(dtc -q -I dtb -O dts "$T/good.dtb")" "case 16: fixture has no __symbols__"
 
 # --- Case 17: a path override that deletes read-only is caught in the DTB ---
 wrap_flash "$T/patched.dts" "$T/b3.dtb" \
-    '&{/soc/spi@1100b000/flash@0/partitions/partition@40000} { /delete-property/ read-only; };'
+    '&{/soc/spi@11009000/flash@0/partitions/partition@40000} { /delete-property/ read-only; };'
 dtb_fails "case 17" "$T/b3.dtb" 'factory is not read-only'
 
 # --- Case 18: the node reopened to delete read-only is caught in the DTB ---
 # (dtc ignores a /delete-property/ in the same body as the property, as in
 # case 13; that form is refused by the source check and harmless when built.)
 wrap_flash "$T/patched.dts" "$T/b2.dtb" \
-    '/ { soc { spi@1100b000 { flash@0 { partitions { partition@40000 { /delete-property/ read-only; }; }; }; }; }; };'
+    '/ { soc { spi@11009000 { flash@0 { partitions { partition@40000 { /delete-property/ read-only; }; }; }; }; }; };'
 dtb_fails "case 18" "$T/b2.dtb" 'factory is not read-only'
 
 # --- Case 19: an extra child over the MACs is caught in the DTB ---
@@ -176,10 +196,10 @@ insert_after "$T/x.dts" 'reg = <0x00000 0x40000>;' '			};
 wrap_flash "$T/x.dts" "$T/b1.dtb"
 dtb_fails "case 19" "$T/b1.dtb" 'macs@40000 (macs) 0x40000+0x1000 is not in the NOR layout'
 
-# --- Case 20: a DTB without a NOR flash ---
+# --- Case 20: a DTB without the spi2 controller ---
 printf '/dts-v1/;\n/ { model = "none"; };\n' > "$T/empty.dts"
 dtc -q -I dts -O dtb -o "$T/empty.dtb" "$T/empty.dts"
-dtb_fails "case 20" "$T/empty.dtb" 'no spi2 controller: no __symbols__/spi2 and no spi@1100b000 node'
+dtb_fails "case 20" "$T/empty.dtb" 'expected one spi@11009000 node (spi2), found 0'
 
 # --- Case 21: a missing DTB ---
 dtb_fails "case 21" "$T/missing.dtb" 'cannot decompile'
@@ -198,31 +218,85 @@ sed 's/compatible = "fixed-layout";/compatible = "acme,layout";/' "$T/patched.dt
 source_fails "case 23" "$T/x.dts" 'factory nvmem-layout is "acme,layout", expected "fixed-layout"'
 
 # --- Case 24: a decoy jedec,spi-nor carries the table, the real flash is renamed (m_second) ---
-awk '/^&spi2 \{/{s=1} s && /^\tflash@0 \{/{f=1} f{print} f && /^\t\};/{exit}' "$T/patched.dts" |
-    sed 's/[A-Za-z_0-9]*: //; s/reg = <0>;/status = "disabled";/' > "$T/decoy.txt"
+flash_block "$T/patched.dts" spi2 | sed 's/[A-Za-z_0-9]*: //; s/reg = <0>;/status = "disabled";/' > "$T/decoy.txt"
 sed '/^&spi2 {/,/^};/s/compatible = "jedec,spi-nor";/compatible = "winbond,w25q512jv";/' "$T/patched.dts" > "$T/x.dts"
 wrap_flash "$T/x.dts" "$T/decoy.dtb" "/ { decoy { $(cat "$T/decoy.txt") }; };"
-dtb_fails "case 24" "$T/decoy.dtb" '/decoy/flash@0/partitions also carries NOR partitions'
+dtb_fails "case 24" "$T/decoy.dtb" '/decoy/flash@0/partitions is a partition table outside the NOR and NAND flashes'
 
 # --- Case 25: the NOR flash disabled ---
-wrap_flash "$T/patched.dts" "$T/disabled.dtb" '&{/soc/spi@1100b000/flash@0} { status = "disabled"; };'
-dtb_fails "case 25" "$T/disabled.dtb" '/soc/spi@1100b000/flash@0 is disabled'
+wrap_flash "$T/patched.dts" "$T/disabled.dtb" '&{/soc/spi@11009000/flash@0} { status = "disabled"; };'
+dtb_fails "case 25" "$T/disabled.dtb" '/soc/spi@11009000 has no enabled CS0 flash (reg = <0>)'
 
-# --- Case 26: the controller found through __symbols__ ---
+# --- Case 26: an honest __symbols__ passes ---
 CASES=$((CASES + 1))
 DTC_FLAGS=-@ wrap_flash "$T/patched.dts" "$T/symbols.dtb"
+assert_contains 'spi2 = "/soc/spi@11009000"' "$(dtc -q -I dtb -O dts "$T/symbols.dtb")" "case 26: fixture has __symbols__"
 run check-dtb "$T/symbols.dtb"
-assert_eq 0 "$RC" "case 26: __symbols__/spi2 is followed ($OUT)"
+assert_eq 0 "$RC" "case 26: __symbols__/spi2 = /soc/spi@11009000 passes ($OUT)"
 
-# --- Case 27: __symbols__/spi2 wins over the unit address ---
-sed 's/^\t\tspi2: spi@1100b000 {/\t\tspi@1100b000 {/' "$T/wrap.dts" > "$T/x.dts" # keep the tree, move the label
-printf '/ { soc { spi2: spi@1100a000 { reg = <0x1100a000 0x100>; #address-cells = <1>; #size-cells = <0>; }; }; };\n' >> "$T/x.dts"
-dtc -q -@ -I dts -O dtb -o "$T/moved.dtb" "$T/x.dts"
-dtb_fails "case 27" "$T/moved.dtb" '/soc/spi@1100a000 has no flash@0'
+# --- Case 27: __symbols__/spi2 pointing at a path not in the tree ---
+wrap_flash "$T/patched.dts" "$T/sym-missing.dtb" '/ { __symbols__ { spi2 = "/soc/spi@nowhere"; }; };'
+dtb_fails "case 27" "$T/sym-missing.dtb" '__symbols__/spi2 is "/soc/spi@nowhere", expected "/soc/spi@11009000"'
 
 # --- Case 28: the controller itself disabled ---
-wrap_flash "$T/patched.dts" "$T/spi-off.dtb" '&{/soc/spi@1100b000} { status = "disabled"; };'
-dtb_fails "case 28" "$T/spi-off.dtb" '/soc/spi@1100b000 is disabled'
+wrap_flash "$T/patched.dts" "$T/spi-off.dtb" '&{/soc/spi@11009000} { status = "disabled"; };'
+dtb_fails "case 28" "$T/spi-off.dtb" '/soc/spi@11009000 is disabled'
+
+# --- Case 29: two spi@11009000 nodes under different parents ---
+wrap_flash "$T/patched.dts" "$T/two.dtb" \
+    '/ { bus { #address-cells = <2>; #size-cells = <2>; spi@11009000 { reg = <0 0x11009000 0 0x1000>; }; }; };'
+dtb_fails "case 29" "$T/two.dtb" 'expected one spi@11009000 node (spi2), found 2'
+
+# --- Case 30: __symbols__/spi2 redirected to a decoy (x_sym2) ---
+flash_block "$T/patched.dts" spi2 | sed 's/[A-Za-z_0-9]*: //' > "$T/decoy.txt"
+wrap_flash "$T/patched.dts" "$T/sym-decoy.dtb" \
+    "/ { decoy { #address-cells = <1>; #size-cells = <0>; $(cat "$T/decoy.txt") }; __symbols__ { spi2 = \"/decoy\"; }; };"
+dtb_fails "case 30" "$T/sym-decoy.dtb" '__symbols__/spi2 is "/decoy", expected "/soc/spi@11009000"'
+
+# --- Case 31: a decoy CS1 node named flash@0, the real CS0 flash named flash@1
+# with renamed labels and a writable factory (x_cs) ---
+cat > "$T/cs.txt" <<'EOF'
+	flash@0 { compatible = "acme,nothing"; reg = <1>; };
+	flash@1 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			partition@0 { label = "bl2"; reg = <0x0 0x40000>; };
+			partition@40000 { label = "factory-rw"; reg = <0x40000 0xa0000>; };
+			partition@e0000 { label = "secrets"; reg = <0xe0000 0x20000>; };
+			partition@100000 { label = "fip"; reg = <0x100000 0x80000>; };
+			partition@180000 { label = "rec"; reg = <0x180000 0xc80000>; };
+		};
+	};
+EOF
+wrap_tree "$T/cs.txt" "$T/cs.dtb"
+dtb_fails "case 31" "$T/cs.dtb" 'partition@40000 (factory-rw) 0x40000+0xa0000 is not in the NOR layout'
+
+# --- Case 32: a second child of spi2 with its own partitions ---
+flash_block "$T/patched.dts" spi2 > "$T/nor2.txt"
+printf '\tflash@1 { compatible = "jedec,spi-nor"; reg = <1>; partitions { compatible = "fixed-partitions"; #address-cells = <1>; #size-cells = <1>; part@0 { label = "x"; reg = <0x0 0x1000>; }; }; };\n' >> "$T/nor2.txt"
+wrap_tree "$T/nor2.txt" "$T/cs1.dtb"
+dtb_fails "case 32" "$T/cs1.dtb" '/soc/spi@11009000/flash@1 has a partitions node but is not the enabled CS0 flash'
+
+# --- Case 33: an extra fixed-partitions table elsewhere, arbitrary labels ---
+wrap_flash "$T/patched.dts" "$T/extra.dtb" \
+    '/ { mmc { card { partitions { compatible = "fixed-partitions"; #address-cells = <1>; #size-cells = <1>; part@0 { label = "anything"; reg = <0x0 0x1000>; }; }; }; }; };'
+dtb_fails "case 33" "$T/extra.dtb" '/mmc/card/partitions is a partition table outside the NOR and NAND flashes'
+
+# --- Case 34: spi@11009000 whose reg is somewhere else ---
+flash_block "$T/patched.dts" spi2 > "$T/nor.txt"
+wrap_tree "$T/nor.txt" "$T/reg.dtb"
+sed 's/reg = <0 0x11009000 0 0x1000>;/reg = <0 0x11008000 0 0x1000>;/' "$T/wrap.dts" > "$T/x.dts"
+dtc -q -I dts -O dtb -o "$T/reg.dtb" "$T/x.dts"
+dtb_fails "case 34" "$T/reg.dtb" '/soc/spi@11009000 reg starts at 0x11008000, expected 0x11009000'
+
+# --- Case 35: the only spi@11009000 is not at /soc ---
+sed 's/^\tsoc {$/\tbus {/' "$T/wrap.dts" > "$T/x.dts"
+dtc -q -I dts -O dtb -o "$T/moved.dtb" "$T/x.dts"
+dtb_fails "case 35" "$T/moved.dtb" 'spi2 is at /bus/spi@11009000, expected /soc/spi@11009000'
 
 rm -rf "$T"
 finish

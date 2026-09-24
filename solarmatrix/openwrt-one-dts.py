@@ -106,18 +106,6 @@ def compatible(node):
     return str(node["props"].get("compatible", "")).strip()
 
 
-def layout_children(node):
-    """The children of node that are partitions of NOR_LAYOUT."""
-    layout = set(NOR_LAYOUT)
-    found = []
-    for name, sub in node["children"]:
-        reg = reg_of(sub)
-        label = str(sub["props"].get("label", "")).strip('"')
-        if reg and (label, reg[0], reg[1]) in layout:
-            found.append(label)
-    return found
-
-
 def table_problems(table):
     """Checks a fixed-partitions node. Every child is a partition."""
     problems, parts = [], []
@@ -211,11 +199,8 @@ def source_problems(text):
     for label in re.findall(r"([A-Za-z_]\w*)\s*:\s*[\w@,.+-]+\s*\{", block):
         if re.search(r"&%s\s*\{" % re.escape(label), text):
             problems.append("&%s overrides a node of the NOR table" % label)
-    flash = child(spi2, "flash@0")
-    table = flash and child(flash, "partitions")
-    if not table:
-        return problems + ["&spi2 has no flash@0 { partitions { ... } } block"]
-    return problems + table_problems(table)
+    _, nor_problems = nor_flash_problems(spi2, "&spi2")
+    return problems + nor_problems
 
 
 def walk(node, path="/"):
@@ -224,8 +209,12 @@ def walk(node, path="/"):
         yield from walk(sub, path.rstrip("/") + "/" + name)
 
 
-# The NOR sits on the SoC's spi2 controller, spi@1100b000 (mt7981.dtsi).
-SPI2_UNIT = "spi@1100b000"
+# The SoC's SPI controllers, from mt7981b.dtsi as completed by
+# target/linux/mediatek/patches-6.12/117-complete-mt7981b-dtsi.patch:
+# spi2 = spi@11009000 carries the NOR, spi0 = spi@1100a000 the NAND, and
+# spi1 = spi@1100b000 the mikroBUS spidev.
+SPI2_PATH, SPI2_ADDR = "/soc/spi@11009000", 0x11009000
+SPI0_PATH = "/soc/spi@1100a000"
 
 
 def available(node):
@@ -233,30 +222,58 @@ def available(node):
     return str(node["props"].get("status", '"okay"')).strip() in ('"okay"', '"ok"')
 
 
-def find_spi2(tree):
-    """Returns (path, node) of the spi2 controller, or (problem, None).
+def cells(node, prop):
+    """All 32-bit cells of a <...> property, or None."""
+    value = node["props"].get(prop)
+    if not isinstance(value, str) or not value.startswith("<"):
+        return None
+    try:
+        return [num(t) for t in re.findall(r"[^\s<>,]+", value)]
+    except ValueError:
+        return None
 
-    By path, not by the flash's compatible: a flash bound by part name needs
-    no jedec,spi-nor, and a decoy elsewhere could carry one.
+
+def cs0_flash(ctrl):
+    """The enabled children of an SPI controller at chip select 0."""
+    return [(n, c) for n, c in ctrl["children"]
+            if available(c) and (cells(c, "reg") or [None])[0] == 0]
+
+
+def nor_flash_problems(ctrl, ctrl_path):
+    """Checks the NOR on controller ctrl: its one enabled CS0 child (by reg,
+    not by node name) and that child's partition table.
+
+    Returns (path of the checked table or None, problems).
     """
-    nodes = dict(walk(tree))
-    symbols = child(tree, "__symbols__")
-    target = symbols and symbols["props"].get("spi2")
-    if target:
-        path = str(target).strip('"')
-        if path not in nodes:
-            return "__symbols__/spi2 points to %s, which is not in the tree" % path, None
-        return path, nodes[path]
-    found = [(p, n) for p, n in nodes.items() if p.rsplit("/", 1)[-1] == SPI2_UNIT]
-    if not found:
-        return "no spi2 controller: no __symbols__/spi2 and no %s node" % SPI2_UNIT, None
-    if len(found) > 1:
-        return "%d %s nodes: %s" % (len(found), SPI2_UNIT, ", ".join(p for p, _ in found)), None
-    return found[0]
+    problems, table_path = [], None
+    if not available(ctrl):
+        problems.append("%s is disabled" % ctrl_path)
+    flashes = cs0_flash(ctrl)
+    chosen = None
+    if len(flashes) != 1:
+        problems.append("%s has %s enabled CS0 flash (reg = <0>)"
+                        % (ctrl_path, "no" if not flashes else "more than one"))
+    else:
+        name, chosen = flashes[0]
+        table = child(chosen, "partitions")
+        if not table:
+            problems.append("%s/%s has no partitions node" % (ctrl_path, name))
+        else:
+            table_path = "%s/%s/partitions" % (ctrl_path, name)
+            problems += table_problems(table)
+    for name, node in ctrl["children"]:
+        if node is not chosen and child(node, "partitions"):
+            problems.append("%s/%s has a partitions node but is not the enabled "
+                            "CS0 flash" % (ctrl_path, name))
+    return table_path, problems
 
 
 def dtb_problems(dtb):
-    """Checks the NOR table in a compiled DTB, as the kernel will see it."""
+    """Checks the NOR table in a compiled DTB, as the kernel will see it.
+
+    The controller is found at its fixed path, never through __symbols__:
+    the source can write any __symbols__ node it likes.
+    """
     try:
         text = subprocess.run(["dtc", "-q", "-I", "dtb", "-O", "dts", "-o", "-", dtb],
                               check=True, capture_output=True, text=True).stdout
@@ -269,31 +286,49 @@ def dtb_problems(dtb):
         tree, _ = parse_node(text, root.end())
     except ValueError as e:
         return ["cannot parse the decompiled %s: %s" % (dtb, e)]
+    nodes = dict(walk(tree))
 
-    problems = []
-    spi2_path, spi2 = find_spi2(tree)
-    table = None
-    if spi2 is None:
-        problems.append(spi2_path)
+    problems, allowed = [], set()
+    unit = SPI2_PATH.rsplit("/", 1)[1]
+    named = [p for p in nodes if p.rsplit("/", 1)[-1] == unit]
+    if len(named) != 1:
+        problems.append("expected one %s node (spi2), found %d%s"
+                        % (unit, len(named), (": " + ", ".join(named)) if named else ""))
+    elif named[0] != SPI2_PATH:
+        problems.append("spi2 is at %s, expected %s" % (named[0], SPI2_PATH))
     else:
-        flash_path = spi2_path.rstrip("/") + "/flash@0"
-        flash = child(spi2, "flash@0")
-        table = flash and child(flash, "partitions")
-        if not available(spi2):
-            problems.append("%s is disabled" % spi2_path)
-        if not flash:
-            problems.append("%s has no flash@0" % spi2_path)
-        elif not available(flash):
-            problems.append("%s is disabled" % flash_path)
-        elif not table:
-            problems.append("%s has no partitions node" % flash_path)
-        else:
-            problems += table_problems(table)
-    # A second copy of the table anywhere else could be the one that binds.
+        ctrl = nodes[SPI2_PATH]
+        parent = nodes[SPI2_PATH.rsplit("/", 1)[0]]
+        n_addr = (cells(parent, "#address-cells") or [2])[0]
+        reg = cells(ctrl, "reg") or []
+        addr = 0
+        for cell in reg[:n_addr]:
+            addr = (addr << 32) | cell
+        if len(reg) < n_addr or addr != SPI2_ADDR:
+            problems.append("%s reg starts at %s, expected 0x%x"
+                            % (SPI2_PATH, "0x%x" % addr if reg else "nothing", SPI2_ADDR))
+        table_path, nor_problems = nor_flash_problems(ctrl, SPI2_PATH)
+        problems += nor_problems
+        allowed.add(table_path)
+
+    symbols = child(tree, "__symbols__")
+    target = symbols and symbols["props"].get("spi2")
+    if target and str(target).strip('"') != SPI2_PATH:
+        problems.append('__symbols__/spi2 is %s, expected "%s"' % (target, SPI2_PATH))
+
+    # The NAND table on spi0's CS0 flash is the only other one allowed.
+    nand_ctrl = nodes.get(SPI0_PATH)
+    nand = cs0_flash(nand_ctrl) if nand_ctrl else []
+    if len(nand) == 1 and child(nand[0][1], "partitions"):
+        allowed.add("%s/%s/partitions" % (SPI0_PATH, nand[0][0]))
+
+    # Any other partition table could be the one that binds, whatever it holds.
     for path, node in walk(tree):
-        if node is not table and layout_children(node):
-            problems.append("%s also carries NOR partitions (%s)"
-                            % (path, ", ".join(layout_children(node))))
+        is_table = ('"fixed-partitions"' in compatible(node)
+                    or path.rsplit("/", 1)[-1] == "partitions")
+        if is_table and path not in allowed:
+            problems.append("%s is a partition table outside the NOR and NAND "
+                            "flashes" % path)
     return problems
 
 
