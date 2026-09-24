@@ -64,11 +64,12 @@ require changing the hardcoded `.config` in `build-firmware.sh`.
 ## Device hardening
 
 `solarmatrix/files/` is copied verbatim into the rootfs. The access policy is
-set by one boot script, with two static files as a second layer:
+set by one boot script, with static files as a second layer:
 
 | File | What it does |
 |------|--------------|
 | `etc/uci-defaults/99-solarmatrix-hardening` | Runs on every boot that follows a configuration wipe (after a flash, `firstboot` or a 5-second reset-button press), and on every boot of the NOR recovery system, which is an initramfs. Sets the posture below from the `factory-secrets` state (see [Factory secrets](#factory-secrets)). |
+| `etc/config/dropbear` | Shipped closed: `enable '0'`, password and root-password auth `off`, `DirectInterface 'lan'`, port 22. If the boot script never runs, SSH stays off. |
 | `etc/inittab` | The stock file without its `askconsole` line, so the serial console offers no login. |
 | `etc/solarmatrix/provisioning.pub` | Public half of the provisioning key. The private half stays on the provisioning host and is never committed. |
 | `etc/security-model` | The note on what the device is, and is not, hardened against. |
@@ -82,18 +83,26 @@ The posture, applied before dropbear (`START=19`) binds a socket:
 | NOR | `valid` | key-only on `lan`; `authorized_keys` = the payload's `ssh_keys` |
 | NOR | `corrupt`, or `valid` with no keys or JSON that does not parse | key-only on `lan`, `authorized_keys` empty, logged at `daemon.crit` |
 
+On NOR, dropbear is enabled only after the key-only settings have verifiably
+taken; otherwise it stays disabled.
+
 The script tells NOR from NAND by the last `/` entry in `/proc/mounts`: `rootfs`
-or `tmpfs` is the NOR initramfs, anything else counts as NAND, so a wrong guess
-disables SSH rather than enabling it. It never falls back to the provisioning
+or `tmpfs` means an initramfs, anything else counts as NAND, so a wrong guess
+disables SSH rather than enabling it. The initramfs is normally the NOR recovery
+system, but it is also the NAND `recovery` UBI volume if U-Boot falls back to
+it; both accept the same keys. It never falls back to the provisioning
 key once `factory-secrets` holds anything.
 
 On every boot, root's password field in `/etc/shadow` is set to `*`, which matches
-no password, and `system.@system[0].ttylogin=1` is set. `uhttpd` is disabled if
+no password (the other lines are untouched, and the temp file is created
+`0600`), and `system.@system[0].ttylogin=1` is set. `uhttpd` is disabled if
 present, because it binds `0.0.0.0` and cannot be restricted to the LAN.
 
 WiFi: with a `valid` state, every `wifi-iface` gets the payload's `ssid` and
-`key`, `encryption=psk2` and `disabled=0`. Otherwise every AP is set to
-`disabled=1`.
+`key`, `encryption=psk2` and `disabled=0`, provided the SSID is 1–32 bytes with
+no control characters and the key is 8–63 printable ASCII characters or exactly
+64 hex digits. Otherwise every AP is set to `disabled=1`, and a rejected value
+is logged at `daemon.crit`.
 
 Secrets never reach argv, where `ps` would show them: the JSON reaches
 `jsonfilter` on stdin, and each UCI value reaches `uci batch` on stdin. Values

@@ -1,0 +1,14 @@
+# See https://openwrt.org/docs/guide-user/base-system/dropbear
+#
+# Shipped closed: nothing listens and no password is accepted until
+# /etc/uci-defaults/99-solarmatrix-hardening enables SSH on the NOR recovery
+# system. If that script never runs, SSH stays off.
+config dropbear main
+	option enable '0'
+	option PasswordAuth 'off'
+	option RootPasswordAuth 'off'
+	option DirectInterface 'lan'
+	option Port '22'
+#	option BannerFile   '/etc/banner'
+#	option LocalPortForward 'off'
+#	option RemotePortForward 'off'

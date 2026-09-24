@@ -8,6 +8,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/testlib.sh"
 SCRIPT="$HERE/files/etc/uci-defaults/99-solarmatrix-hardening"
 LIBDIR="$HERE/files/lib/solarmatrix"
+DROPBEAR_CONFIG="$HERE/files/etc/config/dropbear"
+REAL_SED="$(command -v sed)"
 
 NVME_KEY="$(printf 'cd%.0s' $(seq 32))"
 KEYS_JSON='{"v":1,"serial":"SM-1","ssh_keys":["ssh-ed25519 AAAA unit-a","ssh-ed25519 BBBB unit-b"],"wifi":{"ssid":"SolarMatrix-1","key":"s3cret-wifi"},"nvme_key":"'"$NVME_KEY"'"}'
@@ -72,6 +74,16 @@ real="$(dirname "$0")/jsonfilter.real"
 case " $* " in *" -s "*|*" -i "*) exec "$real" "$@" ;; esac
 exec "$real" -s "$(cat)" "$@"
 JF
+    # Records the mode of any temp file beside the shadow file at the moment
+    # the script rewrites it, before any content lands in it.
+    cat > "$t/bin/sed" <<SED
+#!/bin/sh
+for a; do last="\$a"; done
+if [ "\${last:-}" = "\$SOLARMATRIX_SHADOW" ]; then
+    for f in "\$last".*; do [ -e "\$f" ] && ls -l "\$f" | cut -c1-10 >> "\$SHADOW_MODE_LOG"; done
+fi
+exec "$REAL_SED" "\$@"
+SED
     chmod 755 "$t"/bin/*
 }
 
@@ -79,11 +91,13 @@ JF
 run_boot() {
     local t="$1" mounts="$2"; shift 2
     printf '%s\n' "$mounts" > "$t/mounts"
+    ( umask 022
     env PATH="$t/bin:$PATH" UCI_STATE="$t/uci.state" SERVICE_LOG="$t/service.log" \
         LOGGER_LOG="$t/logger.log" ARGV_LOG="$t/argv.log" SOLARMATRIX_LIB="$LIBDIR" \
+        SHADOW_MODE_LOG="$t/shadow-mode.log" \
         SOLARMATRIX_SECRETS_DEV="$t/secrets" SOLARMATRIX_MOUNTS="$t/mounts" \
         SOLARMATRIX_SHADOW="$t/shadow" SOLARMATRIX_AUTH_KEYS="$t/etc/dropbear/authorized_keys" \
-        SOLARMATRIX_PROVISIONING_KEY="$t/provisioning.pub" "$@" sh "$SCRIPT"
+        SOLARMATRIX_PROVISIONING_KEY="$t/provisioning.pub" "$@" sh "$SCRIPT" )
 }
 
 wifi_sections() { printf 'wireless.default_radio0=wifi-iface\nwireless.default_radio1=wifi-iface\n' >> "$1/uci.state"; }
@@ -227,14 +241,108 @@ run_boot "$T" "$MOUNTS_NOR_TMPFS" >/dev/null 2>&1 || true
 assert_contains 'dropbear.@dropbear[0].enable=1' "$(cat "$T/uci.state")" "case 15: tmpfs root is NOR"
 rm -rf "$T"
 T=$(mktemp -d); make_sandbox "$T"
-printf '%s\n' "$MOUNTS_NAND" > "$T/mounts"
-env PATH="$T/bin:$PATH" UCI_STATE="$T/uci.state" SERVICE_LOG="$T/service.log" \
-    LOGGER_LOG="$T/logger.log" ARGV_LOG="$T/argv.log" SOLARMATRIX_LIB="$LIBDIR" \
-    SOLARMATRIX_SECRETS_DEV="$T/secrets" SOLARMATRIX_MOUNTS="$T/no-such-mounts" \
-    SOLARMATRIX_SHADOW="$T/shadow" SOLARMATRIX_AUTH_KEYS="$T/etc/dropbear/authorized_keys" \
-    SOLARMATRIX_PROVISIONING_KEY="$T/provisioning.pub" sh "$SCRIPT" >/dev/null 2>&1 || true
+run_boot "$T" "$MOUNTS_NOR" env SOLARMATRIX_MOUNTS="$T/no-such-mounts" >/dev/null 2>&1 || true
 assert_contains 'dropbear.@dropbear[0].enable=0' "$(cat "$T/uci.state")" "case 15: unreadable mounts is NAND"
 assert_eq '' "$(cat "$T/etc/dropbear/authorized_keys")" "case 15: unreadable mounts accepts no key"
+rm -rf "$T"
+
+# --- Case 16: the shipped dropbear config is closed until the script opens it ---
+CASES=$((CASES + 1))
+CFG="$(cat "$DROPBEAR_CONFIG" 2>/dev/null)"
+assert_eq 1 "$(grep -c '^config dropbear' "$DROPBEAR_CONFIG" 2>/dev/null)" "case 16: exactly one dropbear section"
+assert_contains "option enable '0'" "$CFG" "case 16: disabled by default"
+assert_contains "option PasswordAuth 'off'" "$CFG" "case 16: password auth off"
+assert_contains "option RootPasswordAuth 'off'" "$CFG" "case 16: root password auth off"
+assert_contains "option DirectInterface 'lan'" "$CFG" "case 16: bound to lan"
+assert_contains "option Port '22'" "$CFG" "case 16: port 22"
+assert_eq 1 "$(grep -c "option enable" "$DROPBEAR_CONFIG" 2>/dev/null)" "case 16: no second enable line"
+
+# --- Case 17: NOR does not enable dropbear unless the key-only settings took ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+RC=0; run_boot "$T" "$MOUNTS_NOR" env UCI_FAIL_KEY='dropbear.@dropbear[0].PasswordAuth' >/dev/null 2>&1 || RC=$?
+STATE="$(cat "$T/uci.state")"
+assert_nonzero "$RC" "case 17: exits non-zero"
+assert_not_contains 'dropbear.@dropbear[0].enable=1' "$STATE" "case 17: dropbear not enabled"
+assert_contains 'dropbear.@dropbear[0].enable=0' "$STATE" "case 17: dropbear left disabled"
+assert_contains 'PasswordAuth' "$(cat "$T/logger.log")" "case 17: log names the setting"
+rm -rf "$T"
+
+# --- Case 18: the shadow temp file is never world- or group-readable ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+run_boot "$T" "$MOUNTS_NAND" >/dev/null 2>&1 || true
+MODES="$(cat "$T/shadow-mode.log" 2>/dev/null)"
+assert_contains '-rw-------' "$MODES" "case 18: temp file created 0600"
+assert_not_contains 'r--' "$MODES" "case 18: temp file not readable by others"
+assert_eq 'root:*:19000:0:99999:7:::' "$(sed -n 1p "$T/shadow")" "case 18: root field still rewritten"
+assert_eq '' "$(ls "$T"/shadow.* 2>/dev/null)" "case 18: no temp file left behind"
+rm -rf "$T"
+
+# --- Case 19: WiFi values that could inject UCI commands are refused ---
+for field in ssid key; do
+    CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; wifi_sections "$T"
+    if [ "$field" = ssid ]; then
+        WIFI='"ssid":"Evil\nset dropbear.@dropbear[0].enable=1","key":"s3cret-wifi"'
+    else
+        WIFI='"ssid":"SolarMatrix-1","key":"s3cret-wifi\nset dropbear.@dropbear[0].enable=1"'
+    fi
+    make_secrets "$T/secrets" '{"v":1,"ssh_keys":["ssh-ed25519 AAAA unit-a"],"wifi":{'"$WIFI"'}}'
+    RC=0; run_boot "$T" "$MOUNTS_NAND" >/dev/null 2>&1 || RC=$?
+    STATE="$(cat "$T/uci.state")"
+    assert_nonzero "$RC" "case 19 ($field): exits non-zero"
+    assert_not_contains 'dropbear.@dropbear[0].enable=1' "$STATE" "case 19 ($field): no injected setting"
+    assert_not_contains 'wireless.default_radio0.ssid' "$STATE" "case 19 ($field): no SSID written"
+    assert_not_contains 'wireless.default_radio0.key' "$STATE" "case 19 ($field): no key written"
+    assert_contains 'wireless.default_radio0.disabled=1' "$STATE" "case 19 ($field): APs down"
+    assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 19 ($field): logged"
+    rm -rf "$T"
+done
+
+# --- Case 20: WiFi length and charset limits ---
+# check_wifi SSID KEY WANT: WANT is up or down.
+check_wifi() {
+    local want="$3" t
+    CASES=$((CASES + 1)); t=$(mktemp -d); make_sandbox "$t"; wifi_sections "$t"
+    make_secrets "$t/secrets" '{"v":1,"ssh_keys":["ssh-ed25519 AAAA unit-a"],"wifi":{"ssid":"'"$1"'","key":"'"$2"'"}}'
+    run_boot "$t" "$MOUNTS_NAND" >/dev/null 2>&1 || true
+    if [ "$want" = up ]; then
+        assert_contains 'wireless.default_radio0.disabled=0' "$(cat "$t/uci.state")" "case 20: ssid '$1' key '$2' accepted"
+    else
+        assert_contains 'wireless.default_radio0.disabled=1' "$(cat "$t/uci.state")" "case 20: ssid '$1' key '$2' refused"
+        assert_not_contains 'wireless.default_radio0.ssid' "$(cat "$t/uci.state")" "case 20: ssid '$1' key '$2' not written"
+    fi
+    rm -rf "$t"
+}
+S32="$(printf 'a%.0s' $(seq 32))"; S33="${S32}a"
+K8='12345678'; K7='1234567'; K63="$(printf 'k%.0s' $(seq 63))"
+HEX64="$(printf 'aF%.0s' $(seq 32))"; NONHEX64="$(printf 'g%.0s' $(seq 64))"
+check_wifi "$S32" "$K8" up
+check_wifi "$S33" "$K8" down
+check_wifi 'Tab\there' "$K8" down
+check_wifi 'ok' "$K63" up
+check_wifi 'ok' "$K7" down
+check_wifi 'ok' "$HEX64" up
+check_wifi 'ok' "$NONHEX64" down
+check_wifi 'ok' 'café-key' down
+
+# --- Case 21: unprovisioned but the provisioning key file is missing ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; rm -f "$T/provisioning.pub"
+RC=0; run_boot "$T" "$MOUNTS_NOR" >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 21: exits non-zero"
+assert_eq '' "$(cat "$T/etc/dropbear/authorized_keys")" "case 21: no key accepted"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 21: logged at daemon.crit"
+rm -rf "$T"
+
+# --- Case 22: valid secrets with keys but incomplete WiFi ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; wifi_sections "$T"
+make_secrets "$T/secrets" '{"v":1,"ssh_keys":["ssh-ed25519 AAAA unit-a"],"wifi":{"ssid":"SolarMatrix-1"}}'
+RC=0; run_boot "$T" "$MOUNTS_NOR" >/dev/null 2>&1 || RC=$?
+STATE="$(cat "$T/uci.state")"
+assert_nonzero "$RC" "case 22: exits non-zero"
+assert_eq 'ssh-ed25519 AAAA unit-a' "$(cat "$T/etc/dropbear/authorized_keys")" "case 22: unit key still installed"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 22: logged at daemon.crit"
+assert_contains 'wireless.default_radio0.disabled=1' "$STATE" "case 22: APs down"
+assert_contains 'wireless.default_radio1.disabled=1' "$STATE" "case 22: both APs down"
+assert_not_contains 'wireless.default_radio0.ssid' "$STATE" "case 22: no SSID written"
 rm -rf "$T"
 
 finish

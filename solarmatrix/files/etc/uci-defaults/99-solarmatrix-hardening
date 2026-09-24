@@ -55,13 +55,46 @@ uci_set_verified() {
 	return 1
 }
 
+# byte_count VALUE: bytes, not characters, whatever the locale.
+byte_count() {
+	printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' '
+}
+
+# only_bytes SET VALUE: succeeds if VALUE holds no byte outside the tr SET.
+# Counted with wc, because command substitution would strip newlines.
+only_bytes() {
+	[ "$(printf '%s' "$2" | LC_ALL=C tr -d "$1" | LC_ALL=C wc -c | tr -d ' ')" = 0 ]
+}
+
+# An SSID is 1-32 bytes. Control bytes are refused: a newline would end the
+# `uci batch` line and let the rest run as a UCI command.
+valid_ssid() {
+	local n
+	n="$(byte_count "$1")"
+	[ "$n" -ge 1 ] && [ "$n" -le 32 ] && only_bytes '\040-\176\200-\377' "$1"
+}
+
+# A WPA2 key is an 8-63 byte printable-ASCII passphrase or a 64-hex-digit PSK.
+valid_psk() {
+	local n
+	n="$(byte_count "$1")"
+	if [ "$n" -eq 64 ]; then
+		only_bytes '0123456789abcdefABCDEF' "$1"
+	else
+		[ "$n" -ge 8 ] && [ "$n" -le 63 ] && only_bytes '\040-\176' "$1"
+	fi
+}
+
 # json_get EXPR: prints what jsonfilter finds in $json, fed on stdin.
 json_get() {
 	printf '%s' "$json" | jsonfilter -e "$1" 2>/dev/null
 }
 
-# The NOR recovery system is an initramfs, so the last "/" in the mount table
-# is rootfs or tmpfs; on NAND it is the overlay. Anything else, including an
+# Tells "booted from an initramfs" from "booted the NAND rootfs": in an
+# initramfs the last "/" in the mount table is rootfs or tmpfs; on NAND it is
+# the overlay. The initramfs is normally the NOR recovery system, but it is
+# also the NAND `recovery` UBI volume if U-Boot falls back to that. Both count
+# as "nor" here and accept exactly the same keys. Anything else, including an
 # unreadable table, counts as NAND: a wrong guess then costs SSH, not safety.
 boot_medium() {
 	if awk '$2 == "/" { t = $3 } END { exit !(t == "rootfs" || t == "tmpfs") }' "$MOUNTS" 2>/dev/null; then
@@ -81,9 +114,12 @@ install_auth_keys() {
 
 # --- Concern 1: root has no usable password ---------------------------------
 # `*` matches no password but, unlike `!`, does not make dropbear treat the
-# account as locked, so key login on NOR still works. Written back through
-# cat so the file keeps its owner and mode.
-sed 's/^root:[^:]*:/root:*:/' "$SHADOW" > "$SHADOW.new" && cat "$SHADOW.new" > "$SHADOW"
+# account as locked, so key login on NOR still works. The temp file is
+# created under umask 077 (after removing any stale one, whose mode a
+# redirect would keep) so the other hashes are never readable in it; the
+# result goes back through cat so the file keeps its owner and mode.
+rm -f "$SHADOW.new"
+(umask 077 && sed 's/^root:[^:]*:/root:*:/' "$SHADOW" > "$SHADOW.new") && cat "$SHADOW.new" > "$SHADOW"
 rm -f "$SHADOW.new"
 grep -q '^root:\*:' "$SHADOW" || crit "root password field is not '*'"
 
@@ -105,10 +141,16 @@ json=''
 
 # --- Concern 5: SSH exists only on NOR, key-only -----------------------------
 if [ "$(boot_medium)" = nor ]; then
-	uci_set_verified 'dropbear.@dropbear[0].enable' '1'
-	uci_set_verified 'dropbear.@dropbear[0].PasswordAuth' 'off'
-	uci_set_verified 'dropbear.@dropbear[0].RootPasswordAuth' 'off'
-	uci_set_verified 'dropbear.@dropbear[0].DirectInterface' 'lan'
+	# Enabled only once every key-only setting has verifiably taken; the
+	# shipped /etc/config/dropbear is already closed, this keeps it that way.
+	if uci_set_verified 'dropbear.@dropbear[0].PasswordAuth' 'off' &&
+		uci_set_verified 'dropbear.@dropbear[0].RootPasswordAuth' 'off' &&
+		uci_set_verified 'dropbear.@dropbear[0].DirectInterface' 'lan'; then
+		uci_set_verified 'dropbear.@dropbear[0].enable' '1'
+	else
+		crit "dropbear is not key-only on lan; leaving it disabled"
+		uci_set_verified 'dropbear.@dropbear[0].enable' '0'
+	fi
 	case "$state" in
 	empty)
 		if [ -s "$PROV_KEY" ]; then
@@ -144,6 +186,12 @@ if [ "$state" = valid ]; then
 	wkey="$(json_get '@.wifi.key')" || wkey=''
 	if [ -z "$ssid" ] || [ -z "$wkey" ]; then
 		crit "factory-secrets has no complete WiFi credentials; APs stay down"
+		ssid=''; wkey=''
+	elif ! valid_ssid "$ssid"; then
+		crit "factory-secrets WiFi SSID is not 1-32 bytes without control characters; APs stay down"
+		ssid=''; wkey=''
+	elif ! valid_psk "$wkey"; then
+		crit "factory-secrets WiFi key is not 8-63 printable ASCII or 64 hex digits; APs stay down"
 		ssid=''; wkey=''
 	fi
 fi
