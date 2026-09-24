@@ -118,6 +118,7 @@ expect_fail "case 26: dropbear shipped enabled" "does not ship with enable '0'" 
 
 # --- initramfs: this version's exact file only ---
 mkbuild; expect_ok "case 27: initramfs fits" check_initramfs "$B/bin/targets" "$V"
+assert_contains "Verified: initramfs fits recovery (1000 of 13107200 bytes)" "$OUT" "case 27: the message Task 6 looks for"
 mkbuild; head -c 13107200 /dev/zero > "$IMG/openwrt-$V-mediatek-filogic-openwrt_one-initramfs.itb"
 expect_ok "case 28: exactly the recovery size" check_initramfs "$B/bin/targets" "$V"
 mkbuild; head -c 13107201 /dev/zero > "$IMG/openwrt-$V-mediatek-filogic-openwrt_one-initramfs.itb"
@@ -133,29 +134,80 @@ mkbuild; rm "$B"/build_dir/target-*/linux-mediatek_filogic/image-mt7981b-openwrt
 expect_fail "case 33: no DTB" 'expected one image-mt7981b-openwrt-one.dtb' find_dtb "$B/build_dir"
 
 # --- staging: only this version's images, into a fresh out/ ---
-CASES=$((CASES + 1))
-mkbuild
-for f in squashfs-sysupgrade.itb factory.ubi nor-preloader.bin nor-bl31-uboot.fip; do : > "$IMG/openwrt-$V-mediatek-filogic-openwrt_one-$f"; done
-: > "$IMG/openwrt-$V-mediatek-filogic-openwrt_one.manifest"
-: > "$IMG/profiles.json"; : > "$IMG/sha256sums"; : > "$IMG/config.buildinfo"
-: > "$IMG/openwrt-25.12.4-mediatek-filogic-openwrt_one-initramfs.itb"
-: > "$IMG/openwrt-imagebuilder-$V-mediatek-filogic.Linux-x86_64.tar.zst"
-O="$T/out"; mkdir -p "$O"; : > "$O/openwrt-25.12.3-mediatek-filogic-openwrt_one-factory.ubi"
-reset_out_dir "$O"; : > "$O/openwrt-licenses.json"
-run stage_artifacts "$B/bin/targets" "$O" "$V"
-assert_eq 0 "$RC" "case 34: staging succeeds ($OUT)"
-assert_eq "openwrt-$V-mediatek-filogic-openwrt_one-factory.ubi
+# mkstage: bin/ holds this build's images (with content), OpenWrt's own
+# sha256sums (which also lists a stale image), and files that must not be staged.
+mkstage() {
+    mkbuild
+    local f
+    for f in squashfs-sysupgrade.itb factory.ubi nor-preloader.bin nor-bl31-uboot.fip; do
+        echo "image $f" > "$IMG/openwrt-$V-mediatek-filogic-openwrt_one-$f"
+    done
+    echo manifest > "$IMG/openwrt-$V-mediatek-filogic-openwrt_one.manifest"
+    echo '{}' > "$IMG/profiles.json"; : > "$IMG/config.buildinfo"
+    echo old > "$IMG/openwrt-25.12.4-mediatek-filogic-openwrt_one-initramfs.itb"
+    : > "$IMG/openwrt-imagebuilder-$V-mediatek-filogic.Linux-x86_64.tar.zst"
+    (cd "$IMG" && sha256sum -b -- * > sha256sums)
+    echo "0000000000000000000000000000000000000000000000000000000000000000 *packages/stale.apk" >> "$IMG/sha256sums"
+    O="$T/out"; rm -rf "$O"; mkdir -p "$O"
+    : > "$O/openwrt-25.12.3-mediatek-filogic-openwrt_one-factory.ubi"
+    reset_out_dir "$O"; : > "$O/openwrt-licenses.json"
+}
+STAGED="openwrt-$V-mediatek-filogic-openwrt_one-factory.ubi
 openwrt-$V-mediatek-filogic-openwrt_one-initramfs.itb
 openwrt-$V-mediatek-filogic-openwrt_one-nor-bl31-uboot.fip
 openwrt-$V-mediatek-filogic-openwrt_one-nor-preloader.bin
 openwrt-$V-mediatek-filogic-openwrt_one-squashfs-sysupgrade.itb
-openwrt-$V-mediatek-filogic-openwrt_one.manifest
+openwrt-$V-mediatek-filogic-openwrt_one.manifest"
+
+CASES=$((CASES + 1))
+mkstage
+run stage_artifacts "$B/bin/targets" "$O" "$V"
+assert_eq 0 "$RC" "case 34: staging succeeds ($OUT)"
+assert_eq "$STAGED
 openwrt-licenses.json
 profiles.json
 sha256sums" "$(ls "$O")" "case 34: only this build's images, no older ones"
+assert_eq "$STAGED" "$(sed 's/^[0-9a-f]* \*//' "$O/sha256sums" | sort)" "case 34: sha256sums lists exactly the staged images"
+CHECK_RC=0; (cd "$O" && sha256sum -c --quiet sha256sums) >/dev/null 2>&1 || CHECK_RC=$?
+assert_eq 0 "$CHECK_RC" "case 34: sha256sum -c passes in out/"
 
 mkbuild; rm "$IMG"/*
 expect_fail "case 35: nothing to stage" "no openwrt-$V-mediatek-filogic-* images" stage_artifacts "$B/bin/targets" "$T/out" "$V"
+
+# --- a failed copy of any image, not only the last, fails the staging ---
+mkstage; chmod 555 "$O"
+expect_fail "case 36: out/ not writable" "ERROR: could not copy" stage_artifacts "$B/bin/targets" "$O" "$V"
+chmod 755 "$O"
+CASES=$((CASES + 1))
+mkstage; mkdir "$O/openwrt-$V-mediatek-filogic-openwrt_one-factory.ubi"
+chmod 555 "$O/openwrt-$V-mediatek-filogic-openwrt_one-factory.ubi"
+run stage_artifacts "$B/bin/targets" "$O" "$V"
+assert_nonzero "$RC" "case 37: the first image failing to copy fails the staging"
+chmod 755 "$O/openwrt-$V-mediatek-filogic-openwrt_one-factory.ubi"
+
+# --- profiles.json is always produced (JSON_OVERVIEW_IMAGE_INFO default y) ---
+mkstage; rm "$IMG/profiles.json"
+expect_fail "case 38: no profiles.json" 'profiles.json is missing' stage_artifacts "$B/bin/targets" "$O" "$V"
+
+# --- every gate is wired into build-firmware.sh ---
+CASES=$((CASES + 1))
+for GATE in check_defconfig check_overlay_listed delete_stale_overlay find_rootfs_dir \
+            find_dtb check_overlay_in_rootfs check_rootfs_gates check_initramfs \
+            reset_out_dir stage_artifacts; do
+    assert_eq 1 "$(grep -c -E "^[^#]*\b$GATE\b" "$HERE/build-firmware.sh")" "case 39: build-firmware.sh calls $GATE once"
+done
+assert_eq "$(grep -c -E '^[a-z_]+\(\) \{' "$HERE/build-gates.sh")" 11 "case 39: the gate list above covers build-gates.sh (10 gates + gate_error)"
+for DTS_MODE in patch check-dtb; do
+    assert_contains "openwrt-one-dts.py\" $DTS_MODE" "$(cat "$HERE/build-firmware.sh")" "case 39: build-firmware.sh runs openwrt-one-dts.py $DTS_MODE"
+done
+
+# --- INT and TERM stop the build instead of resuming it after cleanup ---
+CASES=$((CASES + 1))
+BF="$(cat "$HERE/build-firmware.sh")"
+assert_contains "trap cleanup EXIT" "$BF" "case 40: cleanup on exit"
+assert_contains "trap 'exit 130' INT" "$BF" "case 40: INT exits"
+assert_contains "trap 'exit 143' TERM" "$BF" "case 40: TERM exits"
+assert_not_contains "trap cleanup EXIT INT TERM" "$BF" "case 40: cleanup is not the INT/TERM handler"
 
 rm -rf "$T"
 finish

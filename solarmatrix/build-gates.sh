@@ -176,7 +176,7 @@ check_initramfs() {
     size="$(wc -c < "$img" | tr -d ' ')"
     [ "$size" -le "$RECOVERY_MAX" ] ||
         gate_error "ERROR: $img is $size bytes, larger than the NOR recovery partition ($RECOVERY_MAX bytes)" || return 1
-    echo "Verified: initramfs $size of $RECOVERY_MAX bytes"
+    echo "Verified: initramfs fits recovery ($size of $RECOVERY_MAX bytes)"
 }
 
 # reset_out_dir OUT: out/ holds only what this build stages.
@@ -186,18 +186,22 @@ reset_out_dir() {
 }
 
 # stage_artifacts BIN_TARGETS OUT VERSION_NUMBER: copies this build's images
-# (named for its version) and the target's index files into OUT.
+# (named for its version) and profiles.json into OUT, and writes OUT's own
+# sha256sums over the staged images. OpenWrt's sha256sums is not copied: it
+# covers the whole target dir, packages and older images included, so
+# `sha256sum -c` would fail in OUT.
 stage_artifacts() {
-    local dir="$1/mediatek/filogic" out="$2" version="$3" images
+    local dir="$1/mediatek/filogic" out="$2" version="$3" images img
     images="$(find "$dir" -maxdepth 1 -type f -name "openwrt-$version-mediatek-filogic-*" \
         \( -name '*.itb' -o -name '*.ubi' -o -name '*.bin' -o -name '*.fip' \
-        -o -name '*.img*' -o -name '*.manifest' \) 2>/dev/null)"
+        -o -name '*.img*' -o -name '*.manifest' \) 2>/dev/null | sort)"
     [ -n "$images" ] || gate_error "ERROR: no openwrt-$version-mediatek-filogic-* images in $dir" || return 1
-    printf '%s\n' "$images" | while IFS= read -r img; do
-        cp "$img" "$out/" && echo "$img"
-    done
-    local index
-    for index in profiles.json sha256sums; do
-        [ ! -f "$dir/$index" ] || cp "$dir/$index" "$out/"
-    done
+    [ -f "$dir/profiles.json" ] || gate_error "ERROR: $dir/profiles.json is missing" || return 1
+    while IFS= read -r img; do
+        cp "$img" "$out/" || gate_error "ERROR: could not copy $img to $out" || return 1
+        echo "$img"
+    done <<< "$images"
+    cp "$dir/profiles.json" "$out/" || gate_error "ERROR: could not copy $dir/profiles.json to $out" || return 1
+    ( cd "$out" && sha256sum -b -- "openwrt-$version"-* ) > "$out/sha256sums" ||
+        gate_error "ERROR: could not write $out/sha256sums" || return 1
 }

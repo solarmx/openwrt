@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Builds the SolarMatrix firmware from this OpenWRT fork.
-# Takes an OpenWRT tag argument -- or the word "latest", which resolves to
-# the newest stable upstream release tag -- builds, and emits firmware +
-# licenses JSON under solarmatrix/out/.
+# Takes an optional OpenWRT tag argument -- without one it builds PINNED_TAG;
+# the word "latest" resolves to the newest stable upstream release tag --
+# builds, and emits firmware + licenses JSON under solarmatrix/out/.
 #
 # "latest" is resolved once, up front, and everything downstream sees the
-# concrete tag it resolved to: the checkout, the version file, tag.txt and
-# the license manifest. A build is therefore still reproducible after the
+# concrete tag it resolved to: the checkout, CONFIG_VERSION_NUMBER, the image
+# names, tag.txt and the license manifest. A build is therefore still reproducible after the
 # fact, because the artifacts record which tag was actually built.
 #
 # This script is part of the GPL-2.0 OpenWRT fork. It contains no proprietary
@@ -97,7 +97,11 @@ cleanup() {
             echo "WARNING: could not restore $DTS from $TAG" >&2
     fi
 }
-trap cleanup EXIT INT TERM
+# INT and TERM only exit; the EXIT trap then cleans up once, and the build does
+# not resume after the interrupted command.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 step "Target OpenWRT tag: $TAG"
 
