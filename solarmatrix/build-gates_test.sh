@@ -208,7 +208,7 @@ for GATE in check_defconfig check_overlay_listed delete_stale_overlay find_rootf
             find_dtb check_overlay_in_rootfs check_rootfs_gates check_initramfs \
             reset_out_dir stage_artifacts; do
     assert_eq 1 "$(grep -c -E "^[^#]*\b$GATE\b" "$HERE/build-firmware.sh")" "case 39: build-firmware.sh calls $GATE once"
-    assert_eq 0 "$(grep -c -E "^[^#]*\b$GATE\b.*\|\|[[:space:]]*(true|:)([[:space:]]|;|\)|\$)" "$HERE/build-firmware.sh")" "case 39: $GATE's failure is not swallowed"
+    assert_eq 0 "$(grep -c -E "^[^#]*\b$GATE\b.*\|\|" "$HERE/build-firmware.sh")" "case 39: no || after $GATE: its failure must stop the build"
 done
 assert_eq "$(grep -c -E '^[a-z_]+\(\) \{' "$HERE/build-gates.sh")" 11 "case 39: the gate list above covers build-gates.sh (10 gates + gate_error)"
 for DTS_MODE in patch check-dtb; do
