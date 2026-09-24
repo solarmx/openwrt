@@ -142,6 +142,66 @@ SMFS1 <len> <sha256-hex>\n     ASCII header, at most 128 bytes
 For tests, `SOLARMATRIX_SECRETS_DEV` overrides the device `sm_secrets_dev`
 returns and `SOLARMATRIX_MTD` replaces `/proc/mtd`.
 
+## NVMe storage
+
+The NVMe partition `/dev/nvme0n1p1` is mounted at `/solarmatrix` by
+`/etc/init.d/solarmatrix-mount` at boot (`START=20`, after dropbear), and by
+`/etc/hotplug.d/block/20-solarmatrix-nvme` when the drive appears later; the
+hotplug script unmounts it again on removal. Both, and the CLI below, only call
+`lib/solarmatrix/storage.sh` (`/lib/solarmatrix/storage.sh`), which decides
+from the `factory-secrets` state (see [Factory secrets](#factory-secrets)) and
+the partition type `blkid` reports:
+
+| `factory-secrets` | Partition | Result |
+|---|---|---|
+| `valid` | `crypto_LUKS` | Opened with the payload's `nvme_key` as `/dev/mapper/solarmatrix`, which is mounted as ext4 |
+| `valid` | anything else | Refused, logged at `daemon.crit`: a provisioned unit mounts only its encrypted volume |
+| `empty` | `ext4` | Mounted plain: an unprovisioned unit, or a pilot unit from before encryption |
+| `empty` | anything else | Refused, logged at `daemon.warn`: there is no key to open it |
+| `corrupt` | any | Refused, logged at `daemon.crit` |
+
+The rule is fail-closed: anything not in the two mounting rows leaves
+`/solarmatrix` unmounted. An `nvme_key` that is missing or not exactly 64
+lowercase hex characters is refused too. The key reaches `cryptsetup` on stdin
+only and is never logged.
+
+If `/solarmatrix` is already mounted, an unprovisioned unit accepts it as is. A
+provisioned unit accepts it only when the visible mount is
+`/dev/mapper/solarmatrix`, and a corrupt state never accepts it. A
+`/dev/mapper/solarmatrix` left over from earlier is closed and reopened with
+the current key, never reused, and the mapper is closed again if the mount
+fails. After a successful mount, `config/`, `data/` and `logs/` are created
+under `/solarmatrix`.
+
+Calls are serialized by a lock, since the init script and hotplug can fire
+together at boot. A caller that cannot get it within 30 seconds gives up and
+does not mount. Unmounting also closes the mapper; a failed unmount or close is
+logged at `daemon.crit` and returns non-zero (a failed unmount leaves the
+mapper open).
+
+The mount is not `noexec`: the controller binaries still run from the NVMe.
+
+### `solarmatrix-storage`
+
+`/usr/sbin/solarmatrix-storage` applies the same rules by hand:
+
+| Command | What it does |
+|---|---|
+| `status` | Whether `/solarmatrix` is mounted, from which device, and its usage |
+| `list` | NVMe block devices with their `blkid` type and size; never mounts |
+| `info` | `status` and `list` |
+| `mount` | Mounts via `storage.sh`, as at boot |
+| `umount` | Unmounts and closes the encrypted volume |
+| `remount` | `umount`, then `mount` |
+
+A refused or failed `mount`/`umount` prints only a pointer to the log; the
+reason, like everything the library logs, is in the system log under the tag
+`solarmatrix-storage`:
+
+```sh
+logread -e solarmatrix-storage
+```
+
 ## Tests
 
 The scripts in this directory are covered by shell test suites, run directly:
@@ -150,6 +210,7 @@ The scripts in this directory are covered by shell test suites, run directly:
 ./solarmatrix/collect-licenses_test.sh
 ./solarmatrix/hardening_test.sh
 bash solarmatrix/secrets_test.sh
+bash solarmatrix/storage_test.sh
 ```
 
 `hardening_test.sh` runs the boot script against fake `uci`, `service`, `logger`
@@ -158,6 +219,14 @@ and `jsonfilter` on `PATH`, a fake `factory-secrets` image and a fake
 shadow file, log and recorded argv, so it needs no device.
 `secrets_test.sh` builds partition images in a temp directory and checks
 `secrets.sh` classifies each one correctly, so it needs no device either.
+`storage_test.sh` runs `storage.sh`, the `solarmatrix-mount` init script, the
+hotplug script and the `solarmatrix-storage` CLI against fake `blkid`,
+`cryptsetup`, `mount`, `umount`, `lock` and `logger`, a fake `factory-secrets`
+image and a fake `/proc/mounts`. The library's inputs are overridable for this:
+`SOLARMATRIX_LIB` (library directory), `SOLARMATRIX_MOUNTS` (`/proc/mounts`),
+`SOLARMATRIX_MAPPER_DIR` (`/dev/mapper`), `SOLARMATRIX_MOUNT_POINT`
+(`/solarmatrix`), `SOLARMATRIX_LOCK` and `SOLARMATRIX_LOCK_TRIES`, alongside
+`SOLARMATRIX_SECRETS_DEV`.
 Shared assertions and image builders live in `testlib.sh`.
 
 ## Outputs
