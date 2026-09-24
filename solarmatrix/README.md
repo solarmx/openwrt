@@ -55,7 +55,9 @@ The script:
      tool writes.
 
    The NOR partition table under `&spi2 flash@0` is then checked as a whole.
-   Every child of the `partitions` node counts, whatever it is called, since
+   The `partitions` node must be `compatible = "fixed-partitions"` and
+   factory's `nvmem-layout` `"fixed-layout"`, since another parser would read
+   the children its own way. Every child of the `partitions` node counts, whatever it is called, since
    the kernel makes an MTD partition of any child with a `reg`. The table
    must be exactly `bl2-nor` `0x0+0x40000`, `factory` `0x40000+0xa0000`,
    `factory-secrets` `0xe0000+0x20000`, `fip-nor` `0x100000+0x80000` and
@@ -97,13 +99,22 @@ The script:
    `openwrt-<version>-mediatek-filogic-openwrt_one-initramfs.itb` present and
    no larger than the 13,107,200-byte NOR `recovery` partition; and the NOR
    table of the one compiled `image-mt7981b-openwrt-one.dtb`, decompiled with
-   `dtc`, passing the same rules as in step 5.
+   `dtc`, passing the same rules as in step 5. In the DTB the NOR is found
+   by path, not by its `compatible` (a flash bound by part name needs no
+   `jedec,spi-nor`): the controller `__symbols__/spi2` points to, or else the
+   one `spi@1100b000` node. That controller and its `flash@0` must not be
+   disabled, and no other node anywhere may carry a partition of the NOR
+   layout.
 10. Empties `solarmatrix/out/` and generates
     `solarmatrix/out/openwrt-licenses.json` listing every installed package's
     OSS license (per the build manifest).
-11. Copies this release's firmware images (`openwrt-<version>-mediatek-filogic-*`),
-    `profiles.json` and `sha256sums` to `solarmatrix/out/`; images of older
-    releases left in `bin/targets` are not staged.
+11. Copies this release's firmware images (`openwrt-<version>-mediatek-filogic-*`)
+    and `profiles.json` to `solarmatrix/out/`, failing on any copy that does
+    not succeed, and writes `solarmatrix/out/sha256sums` over exactly the
+    staged images, so `sha256sum -c sha256sums` passes in `out/`. Images of
+    older releases left in `bin/targets` are not staged, and OpenWrt's own
+    `sha256sums` (which covers the whole target directory, packages
+    included) is not copied.
 
 Both `version` and `files/` are generated at build time and removed again by
 the script's exit trap; it refuses to start if either already exists.
@@ -297,7 +308,8 @@ All in `solarmatrix/out/`:
 - `openwrt-<version>-mediatek-filogic-openwrt_one-snand-factory.bin` — SPI NAND factory
 - `openwrt-<version>-mediatek-filogic-openwrt_one-nor-factory.bin` — NOR flash factory
 - `openwrt-<version>-mediatek-filogic-openwrt_one-initramfs.itb` — NOR recovery system
-- plus pre-loaders, FIP bundles, manifest, checksums, profiles.json
+- plus pre-loaders, FIP bundles, manifest and profiles.json
+- `sha256sums` — checksums of the staged images only (`sha256sum -c sha256sums`)
 - `openwrt-licenses.json` — license notices for all installed packages
 - `tag.txt` — the OpenWRT version built
 
