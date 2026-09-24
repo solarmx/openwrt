@@ -12,15 +12,19 @@ From a fresh clone:
 git clone https://github.com/solarmx/openwrt
 cd openwrt
 ./solarmatrix/build-firmware.sh prereqs      # one-time: install apt dependencies
+./solarmatrix/build-firmware.sh              # build the pinned release (PINNED_TAG)
 ./solarmatrix/build-firmware.sh v25.12.5     # build a named release
 ./solarmatrix/build-firmware.sh latest       # build the newest stable release
 ```
 
-The tag argument is required. `latest` resolves to the newest stable
+The tag argument is optional: without one the script builds `PINNED_TAG`
+(set in `build-firmware.sh`, currently `v25.12.5`), so a plain run is
+reproducible from git alone. `latest` resolves to the newest stable
 `vMAJOR.MINOR.PATCH` tag present in your clone, excluding release
-candidates; it is resolved once, up front, so the checkout, the pinned
-`version` file, `tag.txt` and the license manifest all record the concrete
-tag that was built. Fetch upstream tags first if the fork is behind:
+candidates; it is resolved once, up front, so the checkout, the release
+version (`CONFIG_VERSION_NUMBER`, shown as `DISTRIB_RELEASE`), the image
+names, `tag.txt` and the license manifest all record the concrete tag that
+was built. Fetch upstream tags first if the fork is behind:
 
 ```sh
 git fetch upstream --tags     # or use GitHub's "Sync fork" button
@@ -36,48 +40,70 @@ The script:
    remain available.
 4. Stages `solarmatrix/files/` as the top-level `files/` rootfs overlay, which
    OpenWRT copies verbatim into the image (see [Device hardening](#device-hardening)).
-5. Restores the OpenWRT One DTS (`mt7981b-openwrt-one.dts`) from the tag, so a
-   rerun never patches it twice, patches it in memory, and writes it only if
-   every check passes; otherwise the build fails and the DTS is left untouched:
-   - exposes the mikroBUS SPI bus as `/dev/spidev2.0` for the MCP2515 CAN
+5. Patches the OpenWRT One DTS (`mt7981b-openwrt-one.dts`) with
+   `openwrt-one-dts.py`. The file is restored from the tag first, so a rerun
+   never patches it twice; the result is written only if every check passes,
+   otherwise the build fails naming each problem and the DTS is left
+   untouched; and the exit trap restores it from the tag again, on success
+   and on failure, so the next run's tag checkout is not blocked. The edits:
+   - expose the mikroBUS SPI bus as `/dev/spidev2.0` for the MCP2515 CAN
      module (UART2 disabled, `mikrobus-reset` gpio-export dropped);
-   - splits the NOR `factory` partition. `factory` shrinks to
+   - split the NOR `factory` partition. `factory` shrinks to
      `<0x40000 0xa0000>` and keeps the MACs and WiFi calibration read-only. A
      new writable `factory-secrets` partition, `<0xe0000 0x20000>` (128 KiB),
      sits before `fip-nor` and holds the per-device secrets the provisioning
-     tool writes;
-   - parses the NOR partition table under `&spi2 flash@0` and checks it as a
-     whole: exactly `bl2-nor` `0x0+0x40000`, `factory` `0x40000+0xa0000`,
-     `factory-secrets` `0xe0000+0x20000`, `fip-nor` `0x100000+0x80000`,
-     `recovery` `0x180000+0xc80000`, contiguous with no gap, overlap or
-     duplicate label; `factory` read-only with its `eeprom@0`, `macaddr@4` and
-     `macaddr@24` nvmem cells; `factory-secrets` not read-only. Each problem
-     is named in the error.
+     tool writes.
+
+   The NOR partition table under `&spi2 flash@0` is then checked as a whole.
+   Every child of the `partitions` node counts, whatever it is called, since
+   the kernel makes an MTD partition of any child with a `reg`. The table
+   must be exactly `bl2-nor` `0x0+0x40000`, `factory` `0x40000+0xa0000`,
+   `factory-secrets` `0xe0000+0x20000`, `fip-nor` `0x100000+0x80000` and
+   `recovery` `0x180000+0xc80000`: contiguous, with no gap, overlap,
+   duplicate or unknown child, and no child without a `reg`. `factory` must
+   be read-only with its `eeprom@0`, `macaddr@4` and `macaddr@24` nvmem cells
+   inside it; `factory-secrets` must not be read-only. In the source,
+   `/delete-property/` or `/delete-node/` inside `&spi2`, any `&{/path}`
+   reference, and any override of a label defined in `&spi2` are refused
+   too. The same table rules run again on the compiled DTB after the build
+   (step 9).
 6. Writes a hardcoded `.config` for **OpenWRT One** (MediaTek MT7981B,
    filogic subtarget, device `openwrt_one`), with `cryptsetup`, `kmod-dm` and
    `kmod-crypto-xts` for the LUKS2 NVMe, `odhcpd` deselected (the LAN is IPv4
    only), and failsafe compiled out (`CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE`).
-   After `make defconfig` it fails the build if any requested package or the
-   failsafe option was dropped, or if `odhcpd` is still selected.
+   After `make defconfig` it fails the build if any requested package, the
+   release version or the failsafe option was dropped, if `odhcpd` is still
+   selected, if `CONFIG_TARGET_PER_DEVICE_ROOTFS` is set (the device profile,
+   not this `.config`, would decide the image contents), or if `kmod-mtd-rw`
+   (which makes every MTD partition writable) is selected.
 7. Runs `make -j<nproc>` to produce firmware.
 8. Verifies every file under `solarmatrix/files/` reached the rootfs **byte
    for byte**: the boot, hotplug, init and `solarmatrix-storage` scripts must
    also be executable; the sourced libraries, `provisioning.pub`,
-   `security-model`, `inittab`, `config/dropbear` and `uci-defaults/50-dropbear`
-   are compared only (for the last three this proves the overlay replaced the
-   package's own copy). A file under `solarmatrix/files/` that neither list
-   covers fails the build before `make`. Stale copies from a previous build
-   are deleted before `make`, so only a real overlay application can satisfy
-   the check.
+   `security-model`, `inittab`, `config/dropbear` and the two no-op
+   uci-defaults (`50-dropbear`, `50-root-passwd`) are compared only; for the
+   files a package also ships, this proves the overlay replaced the package's
+   copy. Any entry under `solarmatrix/files/` (symlinks included) that neither
+   list in `build-gates.sh` covers fails the build before `make`. Stale copies
+   from a previous build are deleted before `make`, so only a real overlay
+   application can satisfy the check. There must be exactly one rootfs
+   staging directory (`build_dir/target-*/root-mediatek*`).
 9. Verifies U-Boot has no unsigned recovery paths (see the 900 patch), then
-   checks the staged rootfs and image: failsafe disabled in
+   checks the staged rootfs and images: failsafe disabled in
    `lib/preinit/00_preinit.conf`, no `login.sh` in `etc/inittab`, no
-   `usr/sbin/odhcpd`, no obsolete `sbin/solarmatrix-harden-ssh`,
-   `etc/config/dropbear` shipped with `enable '0'`, and an initramfs no larger
-   than the 13,107,200-byte NOR `recovery` partition.
-10. Generates `solarmatrix/out/openwrt-licenses.json` listing every
-   installed package's OSS license (per the build manifest).
-11. Copies firmware images to `solarmatrix/out/`.
+   `usr/sbin/odhcpd` (not even a symlink), no obsolete
+   `sbin/solarmatrix-harden-ssh`, `etc/config/dropbear` shipped with
+   `enable '0'`; this release's
+   `openwrt-<version>-mediatek-filogic-openwrt_one-initramfs.itb` present and
+   no larger than the 13,107,200-byte NOR `recovery` partition; and the NOR
+   table of the one compiled `image-mt7981b-openwrt-one.dtb`, decompiled with
+   `dtc`, passing the same rules as in step 5.
+10. Empties `solarmatrix/out/` and generates
+    `solarmatrix/out/openwrt-licenses.json` listing every installed package's
+    OSS license (per the build manifest).
+11. Copies this release's firmware images (`openwrt-<version>-mediatek-filogic-*`),
+    `profiles.json` and `sha256sums` to `solarmatrix/out/`; images of older
+    releases left in `bin/targets` are not staged.
 
 Both `version` and `files/` are generated at build time and removed again by
 the script's exit trap; it refuses to start if either already exists.
@@ -95,6 +121,7 @@ set by one boot script, with static files as a second layer:
 | `etc/uci-defaults/99-solarmatrix-hardening` | Runs on every boot that follows a configuration wipe (after a flash, `firstboot` or a 5-second reset-button press), and on every boot of the NOR recovery system, which is an initramfs. Sets the posture below from the `factory-secrets` state (see [Factory secrets](#factory-secrets)). |
 | `etc/config/dropbear` | Shipped closed: `enable '0'`, password and root-password auth `off`, `DirectInterface 'lan'`, port 22. If the boot script never runs, SSH stays off. |
 | `etc/uci-defaults/50-dropbear` | A no-op that replaces the dropbear package's script of the same name. That one appends `board.json`'s `ssh_authorized_keys` to an empty `authorized_keys`, which it is on every first boot and every NOR recovery boot; SSH keys here come only from `99-solarmatrix-hardening`. |
+| `etc/uci-defaults/50-root-passwd` | A no-op that replaces base-files' script of the same name, which sets root's password from `board.json`'s `credentials.root_password_hash` or `root_password_plain`. Root never has a usable password here. |
 | `etc/inittab` | The stock file without its `askconsole` line, so the serial console offers no login. |
 | `etc/solarmatrix/provisioning.pub` | Public half of the provisioning key. The private half stays on the provisioning host and is never committed. |
 | `etc/security-model` | The note on what the device is, and is not, hardened against. |
@@ -236,6 +263,8 @@ The scripts in this directory are covered by shell test suites, run directly:
 ./solarmatrix/hardening_test.sh
 bash solarmatrix/secrets_test.sh
 bash solarmatrix/storage_test.sh
+bash solarmatrix/dts_test.sh
+bash solarmatrix/build-gates_test.sh
 ```
 
 `hardening_test.sh` runs the boot script against fake `uci`, `service`, `logger`
@@ -252,16 +281,22 @@ image and a fake `/proc/mounts`. The library's inputs are overridable for this:
 `SOLARMATRIX_MAPPER_DIR` (`/dev/mapper`), `SOLARMATRIX_MOUNT_POINT`
 (`/solarmatrix`), `SOLARMATRIX_LOCK` and `SOLARMATRIX_LOCK_TRIES`, alongside
 `SOLARMATRIX_SECRETS_DEV`.
+`dts_test.sh` runs `openwrt-one-dts.py` against copies of the fork's and the
+pinned release's DTS: a clean patch, a refused second patch, and one broken
+NOR table per rule, in the source and, compiled with `dtc` (which it needs),
+in a DTB. `build-gates_test.sh` runs each gate in `build-gates.sh` against a
+fake `.config`, `build_dir` and `bin/targets`, so no build is needed.
 Shared assertions and image builders live in `testlib.sh`.
 
 ## Outputs
 
 All in `solarmatrix/out/`:
 
-- `openwrt-mediatek-filogic-openwrt_one-factory.ubi` — factory flash image
-- `openwrt-mediatek-filogic-openwrt_one-squashfs-sysupgrade.itb` — sysupgrade
-- `openwrt-mediatek-filogic-openwrt_one-snand-factory.bin` — SPI NAND factory
-- `openwrt-mediatek-filogic-openwrt_one-nor-factory.bin` — NOR flash factory
+- `openwrt-<version>-mediatek-filogic-openwrt_one-factory.ubi` — factory flash image
+- `openwrt-<version>-mediatek-filogic-openwrt_one-squashfs-sysupgrade.itb` — sysupgrade
+- `openwrt-<version>-mediatek-filogic-openwrt_one-snand-factory.bin` — SPI NAND factory
+- `openwrt-<version>-mediatek-filogic-openwrt_one-nor-factory.bin` — NOR flash factory
+- `openwrt-<version>-mediatek-filogic-openwrt_one-initramfs.itb` — NOR recovery system
 - plus pre-loaders, FIP bundles, manifest, checksums, profiles.json
 - `openwrt-licenses.json` — license notices for all installed packages
 - `tag.txt` — the OpenWRT version built
