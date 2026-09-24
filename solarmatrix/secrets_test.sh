@@ -88,5 +88,64 @@ esac
 OUT=$(sh -c ". '$LIB'; SOLARMATRIX_SECRETS_DEV=/dev/mtd9 sm_secrets_dev")
 assert_eq /dev/mtd9 "$OUT" "case 11: override honoured"
 
+# --- Cases 12-17: short, unreadable or not-fully-erased reads are corrupt ---
+# "empty" reopens the provisioning key, so it needs positive proof: all
+# 131072 bytes read back, every one 0xFF.
+CASES=$((CASES + 1))
+: > "$T/p"
+assert_eq corrupt "$(state "$T/p")" "case 12: zero-length read"
+
+CASES=$((CASES + 1))
+head -c 8 /dev/zero | tr '\000' '\377' > "$T/p"
+assert_eq corrupt "$(state "$T/p")" "case 13: 8 erased bytes only (truncated partition)"
+
+CASES=$((CASES + 1))
+mkdir "$T/dir"
+assert_eq corrupt "$(state "$T/dir" 2>/dev/null)" "case 14: directory passed as DEV"
+
+CASES=$((CASES + 1))
+assert_eq corrupt "$(state '')" "case 15: empty DEV argument"
+
+# An interrupted re-erase: block 0 erased, block 1 still holds old data.
+CASES=$((CASES + 1))
+head -c 65536 /dev/zero | tr '\000' '\377' > "$T/p"
+head -c 65536 /dev/zero | tr '\000' 'A' >> "$T/p"
+assert_eq corrupt "$(state "$T/p")" "case 16: first block erased, second not"
+
+# The write stopped inside the header itself.
+CASES=$((CASES + 1))
+make_secrets "$T/full" "$JSON"
+head -c 40 "$T/full" > "$T/p"; pad_secrets "$T/p"
+assert_eq corrupt "$(state "$T/p")" "case 17: header cut short"
+
+# --- Case 18: glob characters in the header are never expanded ---
+# If "1?" were globbed it would match the file "12" in the working
+# directory and turn into a length that makes the image hash-valid.
+CASES=$((CASES + 1))
+G='{"v":123456}'
+GSUM=$(printf '%s' "$G" | shasum -a 256 | cut -d' ' -f1)
+{ printf 'SMFS1 1? %s\n' "$GSUM"; printf '%s' "$G"; } > "$T/p"; pad_secrets "$T/p"
+mkdir "$T/cwd"; : > "$T/cwd/12"
+assert_eq corrupt "$(cd "$T/cwd" && state "$T/p")" "case 18: glob in length is corrupt"
+RC=0; OUT=$(cd "$T/cwd" && payload "$T/p") || RC=$?
+assert_nonzero "$RC" "case 18: no payload through a glob header"
+assert_eq '' "$OUT" "case 18: glob header prints nothing"
+{ printf 'SMFS1 * %s\n' "$GSUM"; printf '%s' "$G"; } > "$T/p"; pad_secrets "$T/p"
+assert_eq corrupt "$(cd "$T/cwd" && state "$T/p")" "case 18: star in length is corrupt"
+
+# --- Case 19: sm_secrets_dev reads the partition table from SOLARMATRIX_MTD ---
+CASES=$((CASES + 1))
+{
+    printf 'dev:    size   erasesize  name\n'
+    printf 'mtd4: 000a0000 00010000 "factory"\n'
+    printf 'mtd5: 00020000 00010000 "factory-secrets"\n'
+} > "$T/mtd"
+OUT=$(sh -c ". '$LIB'; SOLARMATRIX_MTD='$T/mtd' sm_secrets_dev")
+assert_eq /dev/mtd5 "$OUT" "case 19: found by label"
+printf 'mtd4: 000a0000 00010000 "factory"\n' > "$T/mtd"
+RC=0; OUT=$(sh -c ". '$LIB'; SOLARMATRIX_MTD='$T/mtd' sm_secrets_dev") || RC=$?
+assert_eq 1 "$RC" "case 19: image without the split returns 1"
+assert_eq '' "$OUT" "case 19: and prints nothing"
+
 rm -rf "$T"
 finish
