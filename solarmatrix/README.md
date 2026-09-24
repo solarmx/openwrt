@@ -110,10 +110,15 @@ The script:
    `spi@1100a000` carries the NAND, spi1 = `spi@1100b000` the mikroBUS
    spidev): there must be exactly one `spi@11009000` node in the tree, at
    `/soc/spi@11009000`, with `reg` starting at `0x11009000`, and if
-   `__symbols__/spi2` exists it must name that path. The controller and its
-   CS0 flash must be enabled. The only partition tables allowed anywhere
-   (any `fixed-partitions` node or any node named `partitions`) are that
-   flash's and the NAND's on spi0's CS0 flash.
+   `__symbols__/spi2` exists it must name that path. The controller must
+   have exactly one CS0 child, whatever its status, and it and the
+   controller must be enabled (by the first string of `status`, as the
+   kernel reads it); no other child of the controller may have any child
+   node. The only partition tables allowed anywhere (any `fixed-partitions`
+   node or any node named `partitions`) are that flash's and the NAND's on
+   spi0's CS0 flash, and no flash on any SPI controller may have direct
+   children with a `reg` and no `compatible`, which ofpart would read as a
+   legacy partition table.
 10. Empties `solarmatrix/out/` and generates
     `solarmatrix/out/openwrt-licenses.json` listing every installed package's
     OSS license (per the build manifest).
