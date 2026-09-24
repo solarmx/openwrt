@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Replaces the dropbear package's own /etc/uci-defaults/50-dropbear. That one
+# appends board.json's ssh_authorized_keys to /etc/dropbear/authorized_keys
+# whenever the file is empty, which it is on every first boot and on every
+# boot of the NOR recovery system. SSH keys on this device come only from
+# 99-solarmatrix-hardening (the unit's factory-secrets or the provisioning
+# key); a board-supplied key must never be accepted, not even when that
+# script fails to replace the file.
+exit 0

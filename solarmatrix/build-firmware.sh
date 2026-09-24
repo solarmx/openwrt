@@ -113,7 +113,35 @@ git checkout "$INVOKING_BRANCH" -- solarmatrix/
 # (include/rootfs.mk: prepare_rootfs). That is how the SolarMatrix hardening
 # scripts get into the image; the tag checkout above does not carry them, so
 # stage them on every build.
+#
+# Every overlay file is listed here, split by how the rootfs copy is checked
+# after the build: executables must also keep their x bit; the rest are
+# sourced or read. A file under solarmatrix/files that is in neither list
+# fails the build, so a new one cannot ship unchecked.
+OVERLAY_EXECUTABLES=(
+    etc/uci-defaults/99-solarmatrix-hardening
+    etc/hotplug.d/block/20-solarmatrix-nvme
+    etc/init.d/solarmatrix-mount
+    etc/init.d/solarmatrix
+    usr/sbin/solarmatrix-storage
+)
+OVERLAY_DATA=(
+    lib/solarmatrix/secrets.sh
+    lib/solarmatrix/storage.sh
+    etc/solarmatrix/provisioning.pub
+    etc/security-model
+    etc/inittab
+    etc/config/dropbear
+    etc/uci-defaults/50-dropbear
+)
 step "Staging solarmatrix/files as the rootfs overlay"
+UNLISTED="$(cd "$REPO_ROOT/solarmatrix/files" && find . -type f | sed 's|^\./||' | sort |
+    grep -vxF -f <(printf '%s\n' "${OVERLAY_EXECUTABLES[@]}" "${OVERLAY_DATA[@]}") || true)"
+if [ -n "$UNLISTED" ]; then
+    echo "ERROR: solarmatrix/files has files the post-build check does not cover:" >&2
+    printf '%s\n' "$UNLISTED" | sed 's/^/  /' >&2
+    exit 1
+fi
 cp -a "$REPO_ROOT/solarmatrix/files" "$REPO_ROOT/files"
 
 # Package patches live under solarmatrix/ for the same reason: the tag checkout
@@ -128,15 +156,15 @@ cp "$REPO_ROOT"/solarmatrix/patches/uboot-mediatek/*.patch \
 # build_dir is not cleaned between builds, so a previous build's copy of these
 # files would satisfy the post-build check even if this build never applied the
 # overlay. Delete them first so only a real application can put them back.
+# The rootfs staging directories sit at build_dir/target-*/root-*; each overlay
+# path is removed relative to them, so no search depth has to match the
+# deepest overlay path.
 if [ -d build_dir ]; then
-    find build_dir -maxdepth 5 \
-        \( -path '*/root-*/etc/uci-defaults/99-solarmatrix-hardening' \
-        -o -path '*/root-*/sbin/solarmatrix-harden-ssh' \
-        -o -path '*/root-*/etc/hotplug.d/block/20-solarmatrix-nvme' \
-        -o -path '*/root-*/etc/init.d/solarmatrix-mount' \
-        -o -path '*/root-*/etc/init.d/solarmatrix' \
-        -o -path '*/root-*/usr/sbin/solarmatrix-storage' \) \
-        -delete
+    while IFS= read -r STALE_ROOT; do
+        for OVERLAY_FILE in "${OVERLAY_EXECUTABLES[@]}" "${OVERLAY_DATA[@]}"; do
+            rm -f "$STALE_ROOT/$OVERLAY_FILE"
+        done
+    done < <(find build_dir -mindepth 2 -maxdepth 2 -type d -name 'root-*')
 fi
 
 # The release version number is CONFIG_VERSION_NUMBER. It is what ends up in
@@ -441,6 +469,17 @@ CONFIG_PACKAGE_curl=y
 # system pool to reach api.solarmatrix.eu. Without this that call fails with
 # an unknown-authority error.
 CONFIG_PACKAGE_ca-certificates=y
+
+# LUKS2 for the NVMe: storage.sh opens it with cryptsetup. kmod-dm carries
+# dm-crypt; the aes-xts cipher needs xts.
+CONFIG_PACKAGE_cryptsetup=y
+CONFIG_PACKAGE_kmod-dm=y
+CONFIG_PACKAGE_kmod-crypto-xts=y
+
+# The household LAN is IPv4 only. Outgoing IPv6 uses odhcp6c, a separate
+# package; odhcpd is the LAN-side DHCPv6/RA server, runs as root, and is a
+# default package of the target, so it has to be deselected explicitly.
+# CONFIG_PACKAGE_odhcpd-ipv6only is not set
 EOF
 
 # Appended rather than placed in the heredoc above, which is quoted so that
@@ -457,6 +496,13 @@ EOF
 printf 'CONFIG_IMAGEOPT=y\n' >> .config
 printf 'CONFIG_VERSIONOPT=y\n' >> .config
 printf 'CONFIG_VERSION_NUMBER="%s"\n' "$VERSION_NUMBER" >> .config
+
+# Failsafe gives a passwordless root shell on a key press during preinit.
+# TARGET_PREINIT_DISABLE_FAILSAFE sits inside "menuconfig PREINITOPT", whose
+# prompt exists only "if IMAGEOPT" (package/base-files/image-config.in), so
+# all three are needed.
+printf 'CONFIG_PREINITOPT=y\n' >> .config
+printf 'CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE=y\n' >> .config
 make defconfig
 
 # defconfig drops unknown symbols without comment, so confirm the packages that
@@ -467,7 +513,7 @@ make defconfig
 step "Verifying requested packages survived defconfig"
 MISSING_PKGS=""
 for PKG in kmod-spi-dev kmod-nvme kmod-fs-ext4 parted e2fsprogs \
-           blkid curl ca-certificates; do
+           blkid curl ca-certificates cryptsetup kmod-dm kmod-crypto-xts; do
     if ! grep -q "^CONFIG_PACKAGE_$PKG=y\$" .config; then
         MISSING_PKGS="$MISSING_PKGS $PKG"
     fi
@@ -477,7 +523,19 @@ if [ -n "$MISSING_PKGS" ]; then
     echo "  They are not selectable in this tree -- are the feeds installed?" >&2
     exit 1
 fi
-echo "Verified: all 8 requested packages are selected"
+echo "Verified: all 11 requested packages are selected"
+
+if ! grep -q '^CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE=y$' .config; then
+    echo "ERROR: defconfig dropped CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE" >&2
+    echo "  The image would offer a passwordless failsafe shell." >&2
+    exit 1
+fi
+if grep -q '^CONFIG_PACKAGE_odhcpd' .config; then
+    echo "ERROR: odhcpd is still selected:" >&2
+    grep '^CONFIG_PACKAGE_odhcpd' .config >&2
+    exit 1
+fi
+echo "Verified: failsafe disabled, odhcpd not selected"
 
 if ! grep -q "^CONFIG_VERSION_NUMBER=\"$VERSION_NUMBER\"\$" .config; then
     echo "ERROR: defconfig dropped CONFIG_VERSION_NUMBER=\"$VERSION_NUMBER\"" >&2
@@ -507,35 +565,31 @@ if ! grep -q "^DISTRIB_RELEASE='$VERSION_NUMBER'\$" "$RELEASE_FILE" 2>/dev/null;
 fi
 echo "Verified: DISTRIB_RELEASE='$VERSION_NUMBER'"
 
-# A hardening script that silently failed to reach the rootfs would ship a
-# device that answers a root password on the LAN, so make it a build failure
-# rather than a surprise in the field. Both files matter: without harden-ssh the
-# boot script and the provisioning tool cannot lock the device at all.
-# Compared byte for byte, not merely found, so a stale or truncated copy fails.
-step "Verifying the hardening overlay reached the rootfs"
-ROOTFS_DIR="$(find build_dir -maxdepth 2 -type d -name 'root-*' | head -1)"
-if [ -z "$ROOTFS_DIR" ]; then
-    echo "ERROR: no rootfs staging directory under build_dir" >&2
-    exit 1
-fi
-for OVERLAY_FILE in \
-    etc/uci-defaults/99-solarmatrix-hardening \
-    sbin/solarmatrix-harden-ssh \
-    etc/hotplug.d/block/20-solarmatrix-nvme \
-    etc/init.d/solarmatrix-mount \
-    etc/init.d/solarmatrix \
-    usr/sbin/solarmatrix-storage \
-; do
-    if ! cmp -s "$REPO_ROOT/solarmatrix/files/$OVERLAY_FILE" "$ROOTFS_DIR/$OVERLAY_FILE"; then
-        echo "ERROR: $OVERLAY_FILE does not match solarmatrix/files/ in the rootfs" >&2
-        echo "  Expected: $REPO_ROOT/solarmatrix/files/$OVERLAY_FILE" >&2
-        echo "  In rootfs: $ROOTFS_DIR/$OVERLAY_FILE" >&2
+# An overlay file that silently failed to reach the rootfs would ship a device
+# without its access policy or its fail-closed storage, so make it a build
+# failure rather than a surprise in the field. Compared byte for byte, not
+# merely found, so a stale or truncated copy fails. The data files include the
+# ones a package also ships (inittab, config/dropbear, uci-defaults/50-dropbear):
+# matching ours proves the overlay replaced the package's version.
+step "Verifying the SolarMatrix overlay reached the rootfs"
+verify_overlay_file() {
+    if ! cmp -s "$REPO_ROOT/solarmatrix/files/$1" "$ROOTFS_DIR/$1"; then
+        echo "ERROR: $1 does not match solarmatrix/files/ in the rootfs" >&2
+        echo "  Expected: $REPO_ROOT/solarmatrix/files/$1" >&2
+        echo "  In rootfs: $ROOTFS_DIR/$1" >&2
         exit 1
     fi
+}
+for OVERLAY_FILE in "${OVERLAY_EXECUTABLES[@]}"; do
+    verify_overlay_file "$OVERLAY_FILE"
     if [ ! -x "$ROOTFS_DIR/$OVERLAY_FILE" ]; then
         echo "ERROR: $OVERLAY_FILE is not executable in the rootfs" >&2
         exit 1
     fi
+    echo "Verified: $ROOTFS_DIR/$OVERLAY_FILE"
+done
+for OVERLAY_FILE in "${OVERLAY_DATA[@]}"; do
+    verify_overlay_file "$OVERLAY_FILE"
     echo "Verified: $ROOTFS_DIR/$OVERLAY_FILE"
 done
 
@@ -567,6 +621,50 @@ for UBOOT_CHECK in \
     fi
     echo "Verified: openwrt_one-$UBOOT_VARIANT: $UBOOT_EXPECT"
 done
+
+# What the rootfs must not contain, checked in the staged rootfs and the built
+# image rather than in .config, so a package that sneaks back in through a
+# dependency, or an overlay that did not take, still fails the build:
+#   - failsafe, a passwordless root shell on a key press during preinit;
+#   - a serial login (base-files' inittab starts login.sh on the console);
+#   - odhcpd, a root-run LAN DHCPv6/RA server this IPv4-only LAN never needs;
+#   - solarmatrix-harden-ssh, removed with the boot access policy rewrite;
+#   - a dropbear config that listens before 99-solarmatrix-hardening decides;
+#   - an initramfs too big for the NOR "recovery" partition it is flashed to.
+step "Verifying failsafe, serial login, odhcpd, SSH defaults and image size"
+if ! grep -q '^pi_preinit_no_failsafe="y"$' "$ROOTFS_DIR/lib/preinit/00_preinit.conf"; then
+    echo "ERROR: failsafe is not disabled in $ROOTFS_DIR/lib/preinit/00_preinit.conf" >&2
+    exit 1
+fi
+if grep -q 'login.sh' "$ROOTFS_DIR/etc/inittab"; then
+    echo "ERROR: $ROOTFS_DIR/etc/inittab still starts a serial login" >&2
+    exit 1
+fi
+if [ -e "$ROOTFS_DIR/usr/sbin/odhcpd" ]; then
+    echo "ERROR: odhcpd is in the rootfs" >&2
+    exit 1
+fi
+if [ -e "$ROOTFS_DIR/sbin/solarmatrix-harden-ssh" ]; then
+    echo "ERROR: the obsolete solarmatrix-harden-ssh is in the rootfs" >&2
+    exit 1
+fi
+if ! grep -q "^[[:space:]]*option enable '0'\$" "$ROOTFS_DIR/etc/config/dropbear"; then
+    echo "ERROR: $ROOTFS_DIR/etc/config/dropbear does not ship with enable '0'" >&2
+    exit 1
+fi
+INITRAMFS="$(find bin/targets -name 'openwrt-*-openwrt_one-initramfs.itb' | head -1)"
+RECOVERY_MAX=13107200   # NOR "recovery" partition, 0xc80000
+if [ -z "$INITRAMFS" ]; then
+    echo "ERROR: no openwrt_one initramfs image under bin/targets" >&2
+    exit 1
+fi
+INITRAMFS_SIZE="$(wc -c < "$INITRAMFS" | tr -d ' ')"
+if [ "$INITRAMFS_SIZE" -gt "$RECOVERY_MAX" ]; then
+    echo "ERROR: $INITRAMFS is $INITRAMFS_SIZE bytes, larger than the NOR recovery partition ($RECOVERY_MAX bytes)" >&2
+    exit 1
+fi
+echo "Verified: failsafe off, no serial login, no odhcpd, dropbear shipped disabled,"
+echo "  initramfs $INITRAMFS_SIZE of $RECOVERY_MAX bytes"
 
 step "Collecting OpenWRT licenses"
 mkdir -p "$OUT_DIR"

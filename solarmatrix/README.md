@@ -36,24 +36,48 @@ The script:
    remain available.
 4. Stages `solarmatrix/files/` as the top-level `files/` rootfs overlay, which
    OpenWRT copies verbatim into the image (see [Device hardening](#device-hardening)).
-5. Patches the OpenWRT One DTS (`mt7981b-openwrt-one.dts`), and fails the
-   build if any edit did not apply:
+5. Restores the OpenWRT One DTS (`mt7981b-openwrt-one.dts`) from the tag, so a
+   rerun never patches it twice, patches it in memory, and writes it only if
+   every check passes; otherwise the build fails and the DTS is left untouched:
    - exposes the mikroBUS SPI bus as `/dev/spidev2.0` for the MCP2515 CAN
      module (UART2 disabled, `mikrobus-reset` gpio-export dropped);
    - splits the NOR `factory` partition. `factory` shrinks to
      `<0x40000 0xa0000>` and keeps the MACs and WiFi calibration read-only. A
      new writable `factory-secrets` partition, `<0xe0000 0x20000>` (128 KiB),
      sits before `fip-nor` and holds the per-device secrets the provisioning
-     tool writes.
+     tool writes;
+   - parses the NOR partition table under `&spi2 flash@0` and checks it as a
+     whole: exactly `bl2-nor` `0x0+0x40000`, `factory` `0x40000+0xa0000`,
+     `factory-secrets` `0xe0000+0x20000`, `fip-nor` `0x100000+0x80000`,
+     `recovery` `0x180000+0xc80000`, contiguous with no gap, overlap or
+     duplicate label; `factory` read-only with its `eeprom@0`, `macaddr@4` and
+     `macaddr@24` nvmem cells; `factory-secrets` not read-only. Each problem
+     is named in the error.
 6. Writes a hardcoded `.config` for **OpenWRT One** (MediaTek MT7981B,
-   filogic subtarget, device `openwrt_one`).
+   filogic subtarget, device `openwrt_one`), with `cryptsetup`, `kmod-dm` and
+   `kmod-crypto-xts` for the LUKS2 NVMe, `odhcpd` deselected (the LAN is IPv4
+   only), and failsafe compiled out (`CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE`).
+   After `make defconfig` it fails the build if any requested package or the
+   failsafe option was dropped, or if `odhcpd` is still selected.
 7. Runs `make -j<nproc>` to produce firmware.
-8. Verifies both hardening scripts reached the rootfs **byte for byte** and are
-   executable, and fails the build if not. Stale copies from a previous build
-   are deleted before `make`, so only a real overlay application can satisfy it.
-9. Generates `solarmatrix/out/openwrt-licenses.json` listing every
+8. Verifies every file under `solarmatrix/files/` reached the rootfs **byte
+   for byte**: the boot, hotplug, init and `solarmatrix-storage` scripts must
+   also be executable; the sourced libraries, `provisioning.pub`,
+   `security-model`, `inittab`, `config/dropbear` and `uci-defaults/50-dropbear`
+   are compared only (for the last three this proves the overlay replaced the
+   package's own copy). A file under `solarmatrix/files/` that neither list
+   covers fails the build before `make`. Stale copies from a previous build
+   are deleted before `make`, so only a real overlay application can satisfy
+   the check.
+9. Verifies U-Boot has no unsigned recovery paths (see the 900 patch), then
+   checks the staged rootfs and image: failsafe disabled in
+   `lib/preinit/00_preinit.conf`, no `login.sh` in `etc/inittab`, no
+   `usr/sbin/odhcpd`, no obsolete `sbin/solarmatrix-harden-ssh`,
+   `etc/config/dropbear` shipped with `enable '0'`, and an initramfs no larger
+   than the 13,107,200-byte NOR `recovery` partition.
+10. Generates `solarmatrix/out/openwrt-licenses.json` listing every
    installed package's OSS license (per the build manifest).
-10. Copies firmware images to `solarmatrix/out/`.
+11. Copies firmware images to `solarmatrix/out/`.
 
 Both `version` and `files/` are generated at build time and removed again by
 the script's exit trap; it refuses to start if either already exists.
@@ -70,6 +94,7 @@ set by one boot script, with static files as a second layer:
 |------|--------------|
 | `etc/uci-defaults/99-solarmatrix-hardening` | Runs on every boot that follows a configuration wipe (after a flash, `firstboot` or a 5-second reset-button press), and on every boot of the NOR recovery system, which is an initramfs. Sets the posture below from the `factory-secrets` state (see [Factory secrets](#factory-secrets)). |
 | `etc/config/dropbear` | Shipped closed: `enable '0'`, password and root-password auth `off`, `DirectInterface 'lan'`, port 22. If the boot script never runs, SSH stays off. |
+| `etc/uci-defaults/50-dropbear` | A no-op that replaces the dropbear package's script of the same name. That one appends `board.json`'s `ssh_authorized_keys` to an empty `authorized_keys`, which it is on every first boot and every NOR recovery boot; SSH keys here come only from `99-solarmatrix-hardening`. |
 | `etc/inittab` | The stock file without its `askconsole` line, so the serial console offers no login. |
 | `etc/solarmatrix/provisioning.pub` | Public half of the provisioning key. The private half stays on the provisioning host and is never committed. |
 | `etc/security-model` | The note on what the device is, and is not, hardened against. |
