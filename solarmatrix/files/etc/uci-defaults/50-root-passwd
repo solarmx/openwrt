@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Replaces base-files' own /etc/uci-defaults/50-root-passwd. That one sets
+# root's password from board.json's credentials.root_password_hash or
+# root_password_plain. Root never has a usable password on this device
+# (99-solarmatrix-hardening sets it to '*'); a board-supplied one must never
+# take, not even when that script fails.
+exit 0

@@ -83,8 +83,21 @@ for GENERATED in version files; do
 done
 
 # Cleanup the top-level 'version' override and 'files' overlay so they don't
-# pollute future builds run outside this script.
-trap 'rm -rf "$REPO_ROOT/version" "$REPO_ROOT/files" "$REPO_ROOT"/package/boot/uboot-mediatek/patches/9*-solarmatrix-*.patch' EXIT INT TERM
+# pollute future builds run outside this script. Once the DTS has been patched
+# it is restored from the tag as well, on success and on failure: left
+# modified, it would make the next run's tag checkout refuse to switch. The
+# restore waits for DTS_PATCHED so an early failure, before the tag checkout,
+# never touches the invoking branch's copy.
+DTS="target/linux/mediatek/dts/mt7981b-openwrt-one.dts"
+DTS_PATCHED=""
+cleanup() {
+    rm -rf "$REPO_ROOT/version" "$REPO_ROOT/files" "$REPO_ROOT"/package/boot/uboot-mediatek/patches/9*-solarmatrix-*.patch
+    if [ -n "$DTS_PATCHED" ]; then
+        git -C "$REPO_ROOT" checkout -q "refs/tags/$TAG" -- "$DTS" ||
+            echo "WARNING: could not restore $DTS from $TAG" >&2
+    fi
+}
+trap cleanup EXIT INT TERM
 
 step "Target OpenWRT tag: $TAG"
 
@@ -109,39 +122,18 @@ git checkout --detach "refs/tags/$TAG"
 step "Overlaying solarmatrix/ from $INVOKING_BRANCH"
 git checkout "$INVOKING_BRANCH" -- solarmatrix/
 
+# The build's checks live in build-gates.sh so build-gates_test.sh can run them
+# against fake trees.
+# shellcheck source=build-gates.sh
+. "$REPO_ROOT/solarmatrix/build-gates.sh"
+
 # OpenWRT's package/install copies $TOPDIR/files verbatim over the rootfs
 # (include/rootfs.mk: prepare_rootfs). That is how the SolarMatrix hardening
 # scripts get into the image; the tag checkout above does not carry them, so
-# stage them on every build.
-#
-# Every overlay file is listed here, split by how the rootfs copy is checked
-# after the build: executables must also keep their x bit; the rest are
-# sourced or read. A file under solarmatrix/files that is in neither list
-# fails the build, so a new one cannot ship unchecked.
-OVERLAY_EXECUTABLES=(
-    etc/uci-defaults/99-solarmatrix-hardening
-    etc/hotplug.d/block/20-solarmatrix-nvme
-    etc/init.d/solarmatrix-mount
-    etc/init.d/solarmatrix
-    usr/sbin/solarmatrix-storage
-)
-OVERLAY_DATA=(
-    lib/solarmatrix/secrets.sh
-    lib/solarmatrix/storage.sh
-    etc/solarmatrix/provisioning.pub
-    etc/security-model
-    etc/inittab
-    etc/config/dropbear
-    etc/uci-defaults/50-dropbear
-)
+# stage them on every build. Every entry must be in build-gates.sh's overlay
+# lists, so none can ship without the post-build check.
 step "Staging solarmatrix/files as the rootfs overlay"
-UNLISTED="$(cd "$REPO_ROOT/solarmatrix/files" && find . -type f | sed 's|^\./||' | sort |
-    grep -vxF -f <(printf '%s\n' "${OVERLAY_EXECUTABLES[@]}" "${OVERLAY_DATA[@]}") || true)"
-if [ -n "$UNLISTED" ]; then
-    echo "ERROR: solarmatrix/files has files the post-build check does not cover:" >&2
-    printf '%s\n' "$UNLISTED" | sed 's/^/  /' >&2
-    exit 1
-fi
+check_overlay_listed "$REPO_ROOT/solarmatrix/files"
 cp -a "$REPO_ROOT/solarmatrix/files" "$REPO_ROOT/files"
 
 # Package patches live under solarmatrix/ for the same reason: the tag checkout
@@ -153,19 +145,9 @@ step "Staging SolarMatrix U-Boot patches"
 cp "$REPO_ROOT"/solarmatrix/patches/uboot-mediatek/*.patch \
     "$REPO_ROOT/package/boot/uboot-mediatek/patches/"
 
-# build_dir is not cleaned between builds, so a previous build's copy of these
-# files would satisfy the post-build check even if this build never applied the
-# overlay. Delete them first so only a real application can put them back.
-# The rootfs staging directories sit at build_dir/target-*/root-*; each overlay
-# path is removed relative to them, so no search depth has to match the
-# deepest overlay path.
-if [ -d build_dir ]; then
-    while IFS= read -r STALE_ROOT; do
-        for OVERLAY_FILE in "${OVERLAY_EXECUTABLES[@]}" "${OVERLAY_DATA[@]}"; do
-            rm -f "$STALE_ROOT/$OVERLAY_FILE"
-        done
-    done < <(find build_dir -mindepth 2 -maxdepth 2 -type d -name 'root-*')
-fi
+# A previous build's copy of an overlay file would satisfy the post-build check
+# even if this build never applied the overlay, so delete them first.
+[ ! -d build_dir ] || delete_stale_overlay build_dir
 
 # The release version number is CONFIG_VERSION_NUMBER. It is what ends up in
 # DISTRIB_RELEASE in /etc/openwrt_release, and it is the number a person means
@@ -191,244 +173,29 @@ mkdir -p tmp
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
-# Two changes to the stock OpenWRT One DTS: userspace SPI access for the CAN
-# module, and a writable NOR partition for per-device secrets.
+# Two changes to the stock OpenWRT One DTS, made by openwrt-one-dts.py (which
+# documents them): userspace SPI for the MCP2515 CAN module on the mikroBUS
+# SPI bus, and the NOR factory partition split into a read-only factory
+# <0x40000 0xa0000> and a writable factory-secrets <0xe0000 0x20000>.
 #
-# The MCP2515 hangs off the mikroBUS SPI bus, which the stock OpenWRT One DTS
-# brings up with no child node -- so nothing binds to it and no /dev/spidev
-# ever appears. Three edits make it reachable from userspace:
+# The result is verified rather than assumed: these are regex edits against an
+# upstream file, and a pattern that silently matched nothing would otherwise
+# yield firmware with no CAN access or no secrets partition, and no error
+# anywhere in the log. The NOR partition table is then checked as a whole, and
+# checked again in the compiled DTB after the build.
 #
-#   - UART2 is disabled: its pins collide with SPI1.
-#   - The mikrobus-reset gpio-export is dropped, so the controller's userspace
-#     driver can own the reset line itself.
-#   - A spidev@0 node is added under &spi1. It is declared as silabs,si3210
-#     because the kernel spidev driver binds only to the parts listed in
-#     spidev_dt_ids and explicitly rejects a generic "spidev" compatible.
-#     See OpenWRT PR #17399.
-#
-# The NOR "factory" partition is split in two:
-#
-#   - factory shrinks to <0x40000 0xa0000>. It still holds the MACs and WiFi
-#     calibration and stays read-only.
-#   - factory-secrets <0xe0000 0x20000> (128 KiB, the previously erased tail
-#     of factory) is added before fip-nor. It is writable, so the provisioning
-#     tool can store per-device secrets there.
-#
-# The result is verified below rather than assumed: these are regex edits
-# against an upstream file, and a pattern that silently matched nothing would
-# otherwise yield firmware with no CAN access or no secrets partition, and no
-# error anywhere in the log. The NOR partition table is then parsed and
-# checked as a whole, because a regex that matched in the wrong place could
-# still leave overlapping partitions or a writable factory.
-#
-# The tag checkout above keeps local modifications to files the tag also has,
-# so a DTS patched by an earlier run would be patched a second time. Restore
-# it first, and write the result only once every check has passed, so a failed
-# run never leaves a half-patched DTS behind.
+# The tag checkout keeps local modifications to files the tag also has, so a
+# DTS patched by an earlier, interrupted run would be patched twice. It is
+# restored from the tag first, the result is written only once every check
+# has passed, and the exit trap restores it again.
 step "Patching the OpenWRT One DTS (userspace SPI, factory-secrets partition)"
-DTS="target/linux/mediatek/dts/mt7981b-openwrt-one.dts"
-git checkout -- "$DTS"
 if [ ! -f "$DTS" ]; then
     echo "ERROR: DTS not found: $DTS" >&2
     exit 1
 fi
-python3 - "$DTS" "$TAG" <<'PY'
-import re, sys
-from pathlib import Path
-
-path, tag = Path(sys.argv[1]), sys.argv[2]
-text = path.read_text()
-
-text = re.sub(r'(&uart2\s*\{[^{}]*?status\s*=\s*")okay(";)',
-              r'\1disabled\2', text, flags=re.S)
-text = re.sub(r'(gpio-export\s*\{[^{}]*)gpio-0\s*\{[^{}]*?\};',
-              r'\1', text, flags=re.S)
-text = re.sub(r'(&spi1\s*\{[^}]*)(status\s*=\s*"okay";\s*)(\};)',
-              r'''\1\2
-	spidev@0 {
-		compatible = "silabs,si3210";
-		reg = <0>;
-		#address-cells = <1>;
-		#size-cells = <0>;
-		spi-max-frequency = <52000000>;
-	};
-\3''', text, flags=re.S)
-
-# factory keeps its MACs and WiFi calibration read-only in 0x0-0x9ffff of the
-# partition; the free, erased tail (0xa0000-0xbffff, measured) becomes
-# factory-secrets, written once by the provisioning tool. The nvmem cells all
-# sit in the first 0x1000 bytes, so shrinking the partition moves none of them.
-text, n_factory = re.subn(
-    r'(label\s*=\s*"factory";\s*reg\s*=\s*<)0x40000 0xc0000(>;)',
-    r'\g<1>0x40000 0xa0000\2', text)
-text, n_secrets = re.subn(
-    r'(\n(\t+)partition@100000 \{\n\t+label = "fip-nor";)',
-    lambda m: ('\n%spartition@e0000 {\n%s\tlabel = "factory-secrets";\n'
-               '%s\treg = <0xe0000 0x20000>;\n%s};\n' % ((m.group(2),) * 4))
-              + m.group(1),
-    text, count=1)
-
-# The NOR layout this firmware and the provisioning tool are built for.
-NOR_LAYOUT = [
-    ("bl2-nor", 0x0, 0x40000),
-    ("factory", 0x40000, 0xa0000),
-    ("factory-secrets", 0xe0000, 0x20000),
-    ("fip-nor", 0x100000, 0x80000),
-    ("recovery", 0x180000, 0xc80000),
-]
-# Cells the kernel reads MACs and WiFi calibration from, by unit address.
-FACTORY_CELLS = ("eeprom@0", "macaddr@4", "macaddr@24")
-
-
-def parse_node(s, i):
-    """Parses the DTS node body that starts just after its '{' at s[i].
-
-    Returns (node, index just past the closing '};'), where node is
-    {"props": {name: raw value, or True for a flag}, "children": [(name, node)]}.
-    """
-    props, children = {}, []
-    while True:
-        i = re.compile(r"\s*").match(s, i).end()
-        if i >= len(s):
-            raise ValueError("unterminated node")
-        if s[i] == "}":
-            end = re.compile(r"\}\s*;").match(s, i)
-            if not end:
-                raise ValueError("node not closed with '};'")
-            return {"props": props, "children": children}, end.end()
-        j = i
-        while j < len(s) and s[j] not in "{;}":
-            if s[j] == '"':
-                j = s.index('"', j + 1)
-            j += 1
-        if j >= len(s) or s[j] == "}":
-            raise ValueError("statement not terminated: %r" % s[i:j][:40])
-        head = s[i:j].strip()
-        if s[j] == "{":
-            child, i = parse_node(s, j + 1)
-            children.append((head.split(":")[-1].strip(), child))
-        else:
-            name, eq, value = head.partition("=")
-            props[name.strip()] = value.strip() if eq else True
-            i = j + 1
-
-
-def child(node, name):
-    return next((c for n, c in node["children"] if n == name), None)
-
-
-def num(token):
-    return int(token, 16) if token.lower().startswith("0x") else int(token)
-
-
-def reg_of(node):
-    m = re.fullmatch(r"<\s*(\S+)\s+(\S+)\s*>", str(node["props"].get("reg", "")))
-    if not m:
-        return None
-    try:
-        return num(m.group(1)), num(m.group(2))
-    except ValueError:
-        return None
-
-
-def nor_problems(text):
-    """Checks the NOR partition table under &spi2 flash@0 as a whole."""
-    refs = list(re.finditer(r"&spi2\s*\{", text))
-    if len(refs) != 1:
-        return ["expected one &spi2 node, found %d" % len(refs)]
-    body = re.sub(r"/\*.*?\*/|//[^\n]*", "", text[refs[0].end():], flags=re.S)
-    try:
-        spi2, _ = parse_node(body, 0)
-    except ValueError as e:
-        return ["cannot parse &spi2: %s" % e]
-    flash = child(spi2, "flash@0")
-    table = flash and child(flash, "partitions")
-    if not table:
-        return ["&spi2 has no flash@0 { partitions { ... } } block"]
-
-    problems, parts = [], []
-    for name, node in table["children"]:
-        if not name.startswith("partition@"):
-            continue
-        label = str(node["props"].get("label", "")).strip('"')
-        reg = reg_of(node)
-        if reg is None:
-            problems.append("NOR %s (%s) has no parsable reg" % (name, label))
-            continue
-        if num("0x" + name.split("@", 1)[1]) != reg[0]:
-            problems.append("NOR %s (%s) unit address does not match its reg "
-                            "offset 0x%x" % (name, label, reg[0]))
-        parts.append((label, reg[0], reg[1], node))
-    parts.sort(key=lambda p: p[1])
-
-    labels = [p[0] for p in parts]
-    for label in sorted(set(labels)):
-        if labels.count(label) > 1:
-            problems.append("NOR partition %s appears %d times"
-                            % (label, labels.count(label)))
-    for a, b in zip(parts, parts[1:]):
-        a_end = a[1] + a[2]
-        if a_end > b[1]:
-            problems.append("NOR partition %s (0x%x-0x%x) overlaps %s (starts 0x%x)"
-                            % (a[0], a[1], a_end - 1, b[0], b[1]))
-        elif a_end < b[1]:
-            problems.append("NOR gap between %s (ends 0x%x) and %s (starts 0x%x)"
-                            % (a[0], a_end - 1, b[0], b[1]))
-    if [p[:3] for p in parts] != NOR_LAYOUT:
-        fmt = lambda ps: ", ".join("%s 0x%x+0x%x" % p[:3] for p in ps)
-        problems.append("NOR partitions are [%s], expected [%s]"
-                        % (fmt(parts), fmt(NOR_LAYOUT)))
-
-    by_label = {p[0]: p for p in parts}
-    factory = by_label.get("factory")
-    if factory:
-        if "read-only" not in factory[3]["props"]:
-            problems.append("factory is not read-only; its MACs and WiFi "
-                            "calibration would be writable")
-        layout = child(factory[3], "nvmem-layout") or {"children": []}
-        for cell_name in FACTORY_CELLS:
-            cell = child(layout, cell_name)
-            reg = cell and reg_of(cell)
-            if not cell:
-                problems.append("factory nvmem cell %s is missing" % cell_name)
-            elif (not reg or reg[0] != num("0x" + cell_name.split("@")[1])
-                  or reg[0] + reg[1] > factory[2]):
-                problems.append("factory nvmem cell %s is not at its unit "
-                                "address inside factory" % cell_name)
-    secrets = by_label.get("factory-secrets")
-    if secrets and "read-only" in secrets[3]["props"]:
-        problems.append("factory-secrets is read-only; the provisioning tool "
-                        "could not write it")
-    return problems
-
-
-problems = []
-if "spidev@0" not in text:
-    problems.append("spidev@0 node was not added under &spi1")
-if "silabs,si3210" not in text:
-    problems.append("spidev compatible string is missing")
-if "mikrobus-reset" in text:
-    problems.append("mikrobus-reset gpio-export was not removed")
-if re.search(r'&uart2\s*\{[^{}]*?status\s*=\s*"okay"', text, flags=re.S):
-    problems.append("uart2 is still enabled and will collide with SPI1")
-if n_factory != 1:
-    problems.append("factory partition was not shrunk to 0x40000 0xa0000")
-if n_secrets != 1 or 'label = "factory-secrets"' not in text:
-    problems.append("factory-secrets partition was not added before fip-nor")
-problems += nor_problems(text)
-
-if problems:
-    sys.stderr.write("ERROR: DTS patch did not apply cleanly to %s:\n" % tag)
-    for problem in problems:
-        sys.stderr.write("  - %s\n" % problem)
-    sys.stderr.write("  The upstream DTS likely changed shape in this release.\n"
-                     "  %s was left unmodified.\n" % path)
-    raise SystemExit(1)
-
-path.write_text(text)
-print("Verified: spidev@0 added, mikrobus-reset removed, uart2 disabled, "
-      "factory split into factory + factory-secrets, NOR table contiguous")
-PY
+DTS_PATCHED=1
+git checkout -q "refs/tags/$TAG" -- "$DTS"
+python3 "$REPO_ROOT/solarmatrix/openwrt-one-dts.py" patch "$DTS" "$TAG"
 
 step "Writing .config for OpenWRT One (mediatek/filogic)"
 cat > .config <<'EOF'
@@ -493,56 +260,23 @@ EOF
 #   VERSION_NUMBER alone        -> dropped
 #   + CONFIG_VERSIONOPT=y       -> dropped
 #   + CONFIG_IMAGEOPT=y as well -> kept
-printf 'CONFIG_IMAGEOPT=y\n' >> .config
-printf 'CONFIG_VERSIONOPT=y\n' >> .config
-printf 'CONFIG_VERSION_NUMBER="%s"\n' "$VERSION_NUMBER" >> .config
-
+#
 # Failsafe gives a passwordless root shell on a key press during preinit.
 # TARGET_PREINIT_DISABLE_FAILSAFE sits inside "menuconfig PREINITOPT", whose
-# prompt exists only "if IMAGEOPT" (package/base-files/image-config.in), so
-# all three are needed.
-printf 'CONFIG_PREINITOPT=y\n' >> .config
-printf 'CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE=y\n' >> .config
+# prompt likewise exists only "if IMAGEOPT" (package/base-files/image-config.in).
+{
+    printf 'CONFIG_IMAGEOPT=y\n'
+    printf 'CONFIG_VERSIONOPT=y\n'
+    printf 'CONFIG_VERSION_NUMBER="%s"\n' "$VERSION_NUMBER"
+    printf 'CONFIG_PREINITOPT=y\n'
+    printf 'CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE=y\n'
+} >> .config
 make defconfig
 
-# defconfig drops unknown symbols without comment, so confirm the packages that
-# make this device work are actually selected. A missing kmod-nvme means the SSD
-# never appears and /solarmatrix cannot mount; a missing kmod-spi-dev means
-# /dev/spidev2.0 never appears and the CAN module is unreachable. Both have
-# shipped before, and neither produced an error at build time.
-step "Verifying requested packages survived defconfig"
-MISSING_PKGS=""
-for PKG in kmod-spi-dev kmod-nvme kmod-fs-ext4 parted e2fsprogs \
-           blkid curl ca-certificates cryptsetup kmod-dm kmod-crypto-xts; do
-    if ! grep -q "^CONFIG_PACKAGE_$PKG=y\$" .config; then
-        MISSING_PKGS="$MISSING_PKGS $PKG"
-    fi
-done
-if [ -n "$MISSING_PKGS" ]; then
-    echo "ERROR: defconfig dropped these packages:$MISSING_PKGS" >&2
-    echo "  They are not selectable in this tree -- are the feeds installed?" >&2
-    exit 1
-fi
-echo "Verified: all 11 requested packages are selected"
-
-if ! grep -q '^CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE=y$' .config; then
-    echo "ERROR: defconfig dropped CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE" >&2
-    echo "  The image would offer a passwordless failsafe shell." >&2
-    exit 1
-fi
-if grep -q '^CONFIG_PACKAGE_odhcpd' .config; then
-    echo "ERROR: odhcpd is still selected:" >&2
-    grep '^CONFIG_PACKAGE_odhcpd' .config >&2
-    exit 1
-fi
-echo "Verified: failsafe disabled, odhcpd not selected"
-
-if ! grep -q "^CONFIG_VERSION_NUMBER=\"$VERSION_NUMBER\"\$" .config; then
-    echo "ERROR: defconfig dropped CONFIG_VERSION_NUMBER=\"$VERSION_NUMBER\"" >&2
-    echo "  Images would be built as SNAPSHOT rather than as this release." >&2
-    exit 1
-fi
-echo "Verified: release version is $VERSION_NUMBER"
+# defconfig drops unknown symbols without comment, so confirm what this device
+# depends on is still selected, and what it must not have is not.
+step "Verifying .config after defconfig"
+check_defconfig .config "$VERSION_NUMBER"
 
 step "Building (this is slow)"
 make -j"$(nproc)" V=s
@@ -552,11 +286,7 @@ make -j"$(nproc)" V=s
 # DISTRIB_RELEASE, so check that instead -- and check it in the rootfs that
 # was actually staged, not in a build variable.
 step "Verifying the release version reached the rootfs"
-ROOTFS_DIR="$(find build_dir -maxdepth 2 -type d -name 'root-*' | head -1)"
-if [ -z "$ROOTFS_DIR" ]; then
-    echo "ERROR: no rootfs staging directory under build_dir" >&2
-    exit 1
-fi
+ROOTFS_DIR="$(find_rootfs_dir build_dir)"
 RELEASE_FILE="$ROOTFS_DIR/etc/openwrt_release"
 if ! grep -q "^DISTRIB_RELEASE='$VERSION_NUMBER'\$" "$RELEASE_FILE" 2>/dev/null; then
     echo "ERROR: $RELEASE_FILE does not report DISTRIB_RELEASE='$VERSION_NUMBER'" >&2
@@ -567,31 +297,9 @@ echo "Verified: DISTRIB_RELEASE='$VERSION_NUMBER'"
 
 # An overlay file that silently failed to reach the rootfs would ship a device
 # without its access policy or its fail-closed storage, so make it a build
-# failure rather than a surprise in the field. Compared byte for byte, not
-# merely found, so a stale or truncated copy fails. The data files include the
-# ones a package also ships (inittab, config/dropbear, uci-defaults/50-dropbear):
-# matching ours proves the overlay replaced the package's version.
+# failure rather than a surprise in the field.
 step "Verifying the SolarMatrix overlay reached the rootfs"
-verify_overlay_file() {
-    if ! cmp -s "$REPO_ROOT/solarmatrix/files/$1" "$ROOTFS_DIR/$1"; then
-        echo "ERROR: $1 does not match solarmatrix/files/ in the rootfs" >&2
-        echo "  Expected: $REPO_ROOT/solarmatrix/files/$1" >&2
-        echo "  In rootfs: $ROOTFS_DIR/$1" >&2
-        exit 1
-    fi
-}
-for OVERLAY_FILE in "${OVERLAY_EXECUTABLES[@]}"; do
-    verify_overlay_file "$OVERLAY_FILE"
-    if [ ! -x "$ROOTFS_DIR/$OVERLAY_FILE" ]; then
-        echo "ERROR: $OVERLAY_FILE is not executable in the rootfs" >&2
-        exit 1
-    fi
-    echo "Verified: $ROOTFS_DIR/$OVERLAY_FILE"
-done
-for OVERLAY_FILE in "${OVERLAY_DATA[@]}"; do
-    verify_overlay_file "$OVERLAY_FILE"
-    echo "Verified: $ROOTFS_DIR/$OVERLAY_FILE"
-done
+check_overlay_in_rootfs "$REPO_ROOT/solarmatrix/files" "$ROOTFS_DIR"
 
 # Stock OpenWrt One U-Boot flashes or boots unsigned images from a button press
 # at power-on, and falls back to TFTP when both NAND systems fail. The 900 patch
@@ -622,66 +330,24 @@ for UBOOT_CHECK in \
     echo "Verified: openwrt_one-$UBOOT_VARIANT: $UBOOT_EXPECT"
 done
 
-# What the rootfs must not contain, checked in the staged rootfs and the built
-# image rather than in .config, so a package that sneaks back in through a
-# dependency, or an overlay that did not take, still fails the build:
-#   - failsafe, a passwordless root shell on a key press during preinit;
-#   - a serial login (base-files' inittab starts login.sh on the console);
-#   - odhcpd, a root-run LAN DHCPv6/RA server this IPv4-only LAN never needs;
-#   - solarmatrix-harden-ssh, removed with the boot access policy rewrite;
-#   - a dropbear config that listens before 99-solarmatrix-hardening decides;
-#   - an initramfs too big for the NOR "recovery" partition it is flashed to.
 step "Verifying failsafe, serial login, odhcpd, SSH defaults and image size"
-if ! grep -q '^pi_preinit_no_failsafe="y"$' "$ROOTFS_DIR/lib/preinit/00_preinit.conf"; then
-    echo "ERROR: failsafe is not disabled in $ROOTFS_DIR/lib/preinit/00_preinit.conf" >&2
-    exit 1
-fi
-if grep -q 'login.sh' "$ROOTFS_DIR/etc/inittab"; then
-    echo "ERROR: $ROOTFS_DIR/etc/inittab still starts a serial login" >&2
-    exit 1
-fi
-if [ -e "$ROOTFS_DIR/usr/sbin/odhcpd" ]; then
-    echo "ERROR: odhcpd is in the rootfs" >&2
-    exit 1
-fi
-if [ -e "$ROOTFS_DIR/sbin/solarmatrix-harden-ssh" ]; then
-    echo "ERROR: the obsolete solarmatrix-harden-ssh is in the rootfs" >&2
-    exit 1
-fi
-if ! grep -q "^[[:space:]]*option enable '0'\$" "$ROOTFS_DIR/etc/config/dropbear"; then
-    echo "ERROR: $ROOTFS_DIR/etc/config/dropbear does not ship with enable '0'" >&2
-    exit 1
-fi
-INITRAMFS="$(find bin/targets -name 'openwrt-*-openwrt_one-initramfs.itb' | head -1)"
-RECOVERY_MAX=13107200   # NOR "recovery" partition, 0xc80000
-if [ -z "$INITRAMFS" ]; then
-    echo "ERROR: no openwrt_one initramfs image under bin/targets" >&2
-    exit 1
-fi
-INITRAMFS_SIZE="$(wc -c < "$INITRAMFS" | tr -d ' ')"
-if [ "$INITRAMFS_SIZE" -gt "$RECOVERY_MAX" ]; then
-    echo "ERROR: $INITRAMFS is $INITRAMFS_SIZE bytes, larger than the NOR recovery partition ($RECOVERY_MAX bytes)" >&2
-    exit 1
-fi
-echo "Verified: failsafe off, no serial login, no odhcpd, dropbear shipped disabled,"
-echo "  initramfs $INITRAMFS_SIZE of $RECOVERY_MAX bytes"
+check_rootfs_gates "$ROOTFS_DIR"
+check_initramfs bin/targets "$VERSION_NUMBER"
 
+# The source check of the NOR table cannot see everything dtc resolves
+# (includes, path and label overrides elsewhere), so check the table again in
+# the DTB the images were built with, as the kernel will read it.
+step "Verifying the NOR partition table in the compiled DTB"
+DTB="$(find_dtb build_dir)"
+python3 "$REPO_ROOT/solarmatrix/openwrt-one-dts.py" check-dtb "$DTB"
+
+# out/ is emptied first so it only ever holds this build's artifacts.
 step "Collecting OpenWRT licenses"
-mkdir -p "$OUT_DIR"
+reset_out_dir "$OUT_DIR"
 OPENWRT_TAG="$TAG" "$REPO_ROOT/solarmatrix/collect-licenses.sh" > "$OUT_DIR/openwrt-licenses.json"
 
 step "Staging firmware artifacts"
-# Copy produced firmware images to solarmatrix/out/ so consumers have one dir.
-find bin/targets -type f \
-    \( -name 'openwrt-*.itb' \
-    -o -name 'openwrt-*.ubi' \
-    -o -name 'openwrt-*.bin' \
-    -o -name 'openwrt-*.fip' \
-    -o -name 'openwrt-*.img*' \
-    -o -name '*.manifest' \
-    -o -name 'profiles.json' \
-    -o -name 'sha256sums' \) \
-    -print -exec cp {} "$OUT_DIR/" \;
+stage_artifacts bin/targets "$OUT_DIR" "$VERSION_NUMBER"
 
 printf '%s\n' "$TAG" > "$OUT_DIR/tag.txt"
 
