@@ -1,97 +1,13 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Mounts the SolarMatrix NVMe partition when it appears after boot; the
+# decision lives in storage.sh.
 
-# SolarMatrix NVMe Auto-Mount Hotplug Script
+[ "$DEVICENAME" = nvme0n1p1 ] || exit 0
+. "${SOLARMATRIX_LIB:-/lib/solarmatrix}/storage.sh"
 
-LOGFILE="/tmp/solarmatrix-mount.log"
-MOUNT_POINT="/solarmatrix"
-MARKER_FILE="${MOUNT_POINT}/.solarmatrix-mount"
-
-log_msg() {
-    echo "$(date '+%a %b %d %H:%M:%S %Y'): $*" >> "${LOGFILE}"
-}
-
-# Only handle NVMe devices
-case "${DEVPATH}" in
-    */nvme*)
-        ;;
-    *)
-        exit 0
-        ;;
+case "$ACTION" in
+add)    sm_storage_mount "/dev/$DEVICENAME" /solarmatrix ;;
+remove) sm_storage_umount /solarmatrix ;;
 esac
-
-DEVICE="/dev/${DEVICENAME}"
-
-case "${ACTION}" in
-    add)
-        log_msg "NVMe device detected: ${DEVICE} (action: add)"
-        
-        # Wait for device to be ready
-        sleep 1
-        
-        # Detect filesystem - try multiple methods
-        FS_TYPE=$(blkid -s TYPE -o value "${DEVICE}" 2>/dev/null || \
-                  block info "${DEVICE}" 2>/dev/null | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || \
-                  echo "")
-        
-        if [ -z "${FS_TYPE}" ]; then
-            log_msg "No filesystem detected on ${DEVICE}"
-            exit 0
-        fi
-        
-        log_msg "Detected filesystem: ${FS_TYPE} on ${DEVICE}"
-        
-        # Check if filesystem is supported
-        case "${FS_TYPE}" in
-            ext4|xfs|btrfs|f2fs|ntfs3)
-                log_msg "Supported filesystem ${FS_TYPE} detected"
-                ;;
-            *)
-                log_msg "Unsupported filesystem: ${FS_TYPE}"
-                exit 0
-                ;;
-        esac
-        
-        # Create mount point if it doesn't exist
-        if [ ! -d "${MOUNT_POINT}" ]; then
-            mkdir -p "${MOUNT_POINT}"
-            log_msg "Created mount point: ${MOUNT_POINT}"
-        fi
-        
-        # Check if already mounted
-        if mount | grep -q " ${MOUNT_POINT} "; then
-            CURRENT_DEV=$(mount | grep " ${MOUNT_POINT} " | awk '{print $1}')
-            log_msg "Mount point already in use by ${CURRENT_DEV}, unmounting..."
-            umount "${MOUNT_POINT}" 2>/dev/null || log_msg "Failed to unmount ${CURRENT_DEV}"
-        fi
-        
-        # Mount the device
-        if mount -t "${FS_TYPE}" "${DEVICE}" "${MOUNT_POINT}"; then
-            log_msg "Successfully mounted ${DEVICE} (${FS_TYPE}) to ${MOUNT_POINT}"
-            
-            # Create directory structure
-            mkdir -p "${MOUNT_POINT}/config" "${MOUNT_POINT}/data" "${MOUNT_POINT}/logs"
-            chmod 755 "${MOUNT_POINT}" "${MOUNT_POINT}/config" "${MOUNT_POINT}/data" "${MOUNT_POINT}/logs"
-            
-            # Create marker file
-            echo "Auto-mounted by SolarMatrix on $(date)" > "${MARKER_FILE}"
-            
-            log_msg "SolarMatrix directory structure created"
-        else
-            log_msg "Failed to mount ${DEVICE}"
-        fi
-        ;;
-        
-    remove)
-        log_msg "NVMe device removed: ${DEVICE} (action: remove)"
-        
-        # Check if this device is mounted at our mount point
-        if mount | grep -q " ${MOUNT_POINT} "; then
-            CURRENT_DEV=$(mount | grep " ${MOUNT_POINT} " | awk '{print $1}')
-            if [ "${CURRENT_DEV}" = "${DEVICE}" ]; then
-                umount "${MOUNT_POINT}" 2>/dev/null && log_msg "Unmounted ${DEVICE}" || log_msg "Failed to unmount ${DEVICE}"
-            fi
-        fi
-        ;;
-esac
-
 exit 0
