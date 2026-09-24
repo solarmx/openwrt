@@ -23,23 +23,37 @@ SM_MAPPER_DIR="${SOLARMATRIX_MAPPER_DIR:-/dev/mapper}"
 SM_MOUNTS="${SOLARMATRIX_MOUNTS:-/proc/mounts}"
 # Init start and hotplug add can both fire for the same partition at boot.
 SM_LOCK="${SOLARMATRIX_LOCK:-/var/lock/solarmatrix-storage}"
+# Seconds to wait for the lock. A caller killed inside the section leaves it
+# held; giving up then fails closed instead of hanging every later mount,
+# shutdown included.
+SM_LOCK_TRIES="${SOLARMATRIX_LOCK_TRIES:-30}"
 
 sm_storage_log() {
 	logger -t solarmatrix-storage -p "daemon.$1" "$2"
 }
 
+# Prints the source mounted at MOUNT_POINT, or nothing.
+_sm_storage_source() {
+	awk -v mp="$1" '$2 == mp { print $1; exit }' "$SM_MOUNTS" 2>/dev/null
+}
+
 _sm_storage_mounted() {
-	cut -d' ' -f2 "$SM_MOUNTS" 2>/dev/null | grep -qxF "$1"
+	[ -n "$(_sm_storage_source "$1")" ]
 }
 
 # _sm_storage_locked FUNCTION ARGS...: runs FUNCTION under the BusyBox lock.
+# lock -n fails at once while someone else holds it, so the wait is bounded.
 _sm_storage_locked() {
-	local rc
+	local rc tries=1
 	mkdir -p "${SM_LOCK%/*}"
-	if ! lock "$SM_LOCK"; then
-		sm_storage_log crit "could not take $SM_LOCK"
-		return 1
-	fi
+	until lock -n "$SM_LOCK" 2>/dev/null; do
+		if [ "$tries" -ge "$SM_LOCK_TRIES" ]; then
+			sm_storage_log crit "$SM_LOCK still held after $SM_LOCK_TRIES tries; giving up"
+			return 1
+		fi
+		tries=$((tries + 1))
+		sleep 1
+	done
 	rc=0
 	"$@" || rc=$?
 	lock -u "$SM_LOCK"
@@ -74,12 +88,21 @@ _sm_storage_open() {
 }
 
 _sm_storage_mount() {
-	local device="$1" mp="$2" dev state type key mapper="$SM_MAPPER_DIR/$SM_MAPPER_NAME"
-
-	_sm_storage_mounted "$mp" && return 0
+	local device="$1" mp="$2" dev state type key src mapper="$SM_MAPPER_DIR/$SM_MAPPER_NAME"
 
 	dev="$(sm_secrets_dev)" || dev=''
 	state="$(sm_secrets_state "$dev")"
+
+	src="$(_sm_storage_source "$mp")"
+	if [ -n "$src" ]; then
+		# A provisioned unit trusts only its own encrypted volume there.
+		if [ "$state" = valid ] && [ "$src" != "$mapper" ]; then
+			sm_storage_log crit "$mp is already mounted from $src, not $mapper"
+			return 1
+		fi
+		return 0
+	fi
+
 	type="$(blkid -s TYPE -o value "$device" 2>/dev/null)"
 
 	case "$state:$type" in
@@ -122,8 +145,15 @@ _sm_storage_mount() {
 
 _sm_storage_umount() {
 	local mp="$1"
-	_sm_storage_mounted "$mp" && umount "$mp"
-	[ -e "$SM_MAPPER_DIR/$SM_MAPPER_NAME" ] && cryptsetup close "$SM_MAPPER_NAME"
+	if _sm_storage_mounted "$mp" && ! umount "$mp"; then
+		# Still in use: closing the mapper under a live mount would fail anyway.
+		sm_storage_log crit "could not unmount $mp"
+		return 1
+	fi
+	if [ -e "$SM_MAPPER_DIR/$SM_MAPPER_NAME" ] && ! cryptsetup close "$SM_MAPPER_NAME"; then
+		sm_storage_log crit "could not close $SM_MAPPER_DIR/$SM_MAPPER_NAME"
+		return 1
+	fi
 	return 0
 }
 
@@ -132,7 +162,9 @@ sm_storage_mount() {
 	_sm_storage_locked _sm_storage_mount "$@"
 }
 
-# sm_storage_umount MOUNT_POINT
+# sm_storage_umount MOUNT_POINT: unmounts MOUNT_POINT and closes the mapper.
+# 0 when both succeeded or there was nothing to do; 1 (logged at crit) when
+# either failed. A failed unmount leaves the mapper open.
 sm_storage_umount() {
 	_sm_storage_locked _sm_storage_umount "$@"
 }

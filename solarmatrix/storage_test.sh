@@ -39,12 +39,19 @@ MNT
     cat > "$t/bin/umount" <<'UMNT'
 #!/bin/sh
 printf '%s\n' "$*" >> "$MOUNT_LOG"
+[ "${UMOUNT_FAIL:-0}" = 1 ] && exit 1
 grep -vF " $1 " "$SOLARMATRIX_MOUNTS" > "$SOLARMATRIX_MOUNTS.new"
 mv "$SOLARMATRIX_MOUNTS.new" "$SOLARMATRIX_MOUNTS"
 exit 0
 UMNT
     printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$LOGGER_LOG"\n' > "$t/bin/logger"
-    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$LOCK_LOG"\n' > "$t/bin/lock"
+    cat > "$t/bin/lock" <<'LCK'
+#!/bin/sh
+printf '%s\n' "$*" >> "$LOCK_LOG"
+[ "$1" = -n ] && [ "${LOCK_FAIL:-0}" = 1 ] && exit 1
+exit 0
+LCK
+    printf '#!/bin/sh\nprintf "sleep %%s\\n" "$*" >> "$LOCK_LOG"\n' > "$t/bin/sleep"
     # The real jsonfilter reads stdin when given neither -s nor -i. This wrapper
     # records its argv (the key must never show up there) and hands stdin to
     # the shared fake.
@@ -238,7 +245,7 @@ rm -rf "$T"
 
 # --- Case 21: mount and umount hold the storage lock, and release it on refusal ---
 CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
-LOCKED="$T/storage.lock
+LOCKED="-n $T/storage.lock
 -u $T/storage.lock"
 run_mount "$T" env BLKID_TYPE=ext4 >/dev/null 2>&1
 assert_eq "$LOCKED" "$(cat "$T/lock.log")" "case 21: mount locks and unlocks"
@@ -283,6 +290,68 @@ rm -rf "$T"
 # --- Case 25: CLI help points at the syslog tag ---
 CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
 assert_contains 'logread -e solarmatrix-storage' "$(in_sandbox "$T" sh "$CLI" help 2>&1)" "case 25: help names the log"
+rm -rf "$T"
+
+# --- Case 26: a failed umount is reported and leaves the volume open ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; touch "$T/mapper/solarmatrix"
+printf '/dev/mapper/solarmatrix %s ext4 rw 0 0\n' "$T/mnt" > "$T/mounts"
+RC=0; in_sandbox "$T" env UMOUNT_FAIL=1 sh -c ". '$LIBDIR/storage.sh'; sm_storage_umount '$T/mnt'" >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 26: library reports failure"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 26: logged at crit"
+assert_eq '' "$(cat "$T/crypt.log")" "case 26: cryptsetup close never called"
+rm -rf "$T"
+
+# --- Case 27: a failed close is reported ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; touch "$T/mapper/solarmatrix"
+RC=0; in_sandbox "$T" env CRYPT_CLOSE_FAIL=1 sh -c ". '$LIBDIR/storage.sh'; sm_storage_umount '$T/mnt'" >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 27: library reports failure"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 27: logged at crit"
+rm -rf "$T"
+
+# --- Case 28: CLI umount and remount fail when umount fails ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$JSON"
+touch "$T/mapper/solarmatrix"
+printf '/dev/mapper/solarmatrix %s ext4 rw 0 0\n' "$T/mnt" > "$T/mounts"
+RC=0; OUT=$(in_sandbox "$T" env UMOUNT_FAIL=1 sh "$CLI" umount 2>&1) || RC=$?
+assert_nonzero "$RC" "case 28: CLI umount exits non-zero"
+assert_not_contains 'Unmounted' "$OUT" "case 28: CLI umount does not claim success"
+assert_contains 'Not unmounted; see logread -e solarmatrix-storage' "$OUT" "case 28: CLI umount says why"
+: > "$T/mount.log"
+RC=0; OUT=$(in_sandbox "$T" env UMOUNT_FAIL=1 BLKID_TYPE=crypto_LUKS sh "$CLI" remount 2>&1) || RC=$?
+assert_nonzero "$RC" "case 28: CLI remount exits non-zero"
+assert_eq "$T/mnt" "$(cat "$T/mount.log")" "case 28: remount never mounts"
+assert_eq '' "$(cat "$T/crypt.log")" "case 28: remount never runs cryptsetup"
+rm -rf "$T"
+
+# --- Case 29: a lock that stays taken times out and refuses ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+RC=0; run_mount "$T" env BLKID_TYPE=ext4 LOCK_FAIL=1 SOLARMATRIX_LOCK_TRIES=3 >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 29: refused"
+assert_eq "-n $T/storage.lock
+sleep 1
+-n $T/storage.lock
+sleep 1
+-n $T/storage.lock" "$(cat "$T/lock.log")" "case 29: retried, then gave up without unlocking"
+assert_eq '' "$(cat "$T/mount.log")" "case 29: nothing mounted"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 29: logged at crit"
+rm -rf "$T"
+
+# --- Case 30: provisioned + already mounted from the mapper is a no-op success ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$JSON"
+printf '%s %s ext4 rw 0 0\n' "$T/mapper/solarmatrix" "$T/mnt" > "$T/mounts"
+RC=0; run_mount "$T" env BLKID_TYPE=crypto_LUKS >/dev/null 2>&1 || RC=$?
+assert_eq 0 "$RC" "case 30: success"
+assert_eq '' "$(cat "$T/mount.log")" "case 30: not mounted twice"
+assert_eq '' "$(cat "$T/crypt.log")" "case 30: no cryptsetup"
+rm -rf "$T"
+
+# --- Case 31: provisioned + mounted from anything but the mapper is refused ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$JSON"
+printf '/dev/nvme0n1p1 %s ext4 rw 0 0\n' "$T/mnt" > "$T/mounts"
+RC=0; run_mount "$T" env BLKID_TYPE=crypto_LUKS >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 31: refused"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 31: logged at crit"
+assert_eq '' "$(cat "$T/mount.log")" "case 31: nothing mounted"
 rm -rf "$T"
 
 finish
