@@ -225,7 +225,7 @@ dtb_fails "case 24" "$T/decoy.dtb" '/decoy/flash@0/partitions is a partition tab
 
 # --- Case 25: the NOR flash disabled ---
 wrap_flash "$T/patched.dts" "$T/disabled.dtb" '&{/soc/spi@11009000/flash@0} { status = "disabled"; };'
-dtb_fails "case 25" "$T/disabled.dtb" '/soc/spi@11009000 has no enabled CS0 flash (reg = <0>)'
+dtb_fails "case 25" "$T/disabled.dtb" '/soc/spi@11009000/flash@0 is disabled'
 
 # --- Case 26: an honest __symbols__ passes ---
 CASES=$((CASES + 1))
@@ -279,7 +279,7 @@ dtb_fails "case 31" "$T/cs.dtb" 'partition@40000 (factory-rw) 0x40000+0xa0000 is
 flash_block "$T/patched.dts" spi2 > "$T/nor2.txt"
 printf '\tflash@1 { compatible = "jedec,spi-nor"; reg = <1>; partitions { compatible = "fixed-partitions"; #address-cells = <1>; #size-cells = <1>; part@0 { label = "x"; reg = <0x0 0x1000>; }; }; };\n' >> "$T/nor2.txt"
 wrap_tree "$T/nor2.txt" "$T/cs1.dtb"
-dtb_fails "case 32" "$T/cs1.dtb" '/soc/spi@11009000/flash@1 has a partitions node but is not the enabled CS0 flash'
+dtb_fails "case 32" "$T/cs1.dtb" '/soc/spi@11009000/flash@1 has child nodes but is not the NOR flash'
 
 # --- Case 33: an extra fixed-partitions table elsewhere, arbitrary labels ---
 wrap_flash "$T/patched.dts" "$T/extra.dtb" \
@@ -297,6 +297,79 @@ dtb_fails "case 34" "$T/reg.dtb" '/soc/spi@11009000 reg starts at 0x11008000, ex
 sed 's/^\tsoc {$/\tbus {/' "$T/wrap.dts" > "$T/x.dts"
 dtc -q -I dts -O dtb -o "$T/moved.dtb" "$T/x.dts"
 dtb_fails "case 35" "$T/moved.dtb" 'spi2 is at /bus/spi@11009000, expected /soc/spi@11009000'
+
+# --- Case 36: two CS0 children on spi2, whatever their status ---
+flash_block "$T/patched.dts" spi2 > "$T/nor2.txt"
+printf '\tnor@0 { compatible = "jedec,spi-nor"; reg = <0>; status = "disabled"; };\n' >> "$T/nor2.txt"
+wrap_tree "$T/nor2.txt" "$T/two-cs0.dtb"
+dtb_fails "case 36" "$T/two-cs0.dtb" '/soc/spi@11009000 has 2 CS0 children (reg = <0>), expected exactly one'
+
+# --- Case 37: a node named partitions, not fixed-partitions, outside the flashes ---
+wrap_flash "$T/patched.dts" "$T/name-arm.dtb" '/ { misc { partitions { compatible = "acme,parts"; }; }; };'
+dtb_fails "case 37" "$T/name-arm.dtb" '/misc/partitions is a partition table outside the NOR and NAND flashes'
+
+# --- Case 38: a fixed-partitions node not named partitions ---
+wrap_flash "$T/patched.dts" "$T/compat-arm.dtb" \
+    '/ { misc { nor-table { compatible = "fixed-partitions"; #address-cells = <1>; #size-cells = <1>; }; }; };'
+dtb_fails "case 38" "$T/compat-arm.dtb" '/misc/nor-table is a partition table outside the NOR and NAND flashes'
+
+# --- Case 39: every #address-cells cell counts in the controller address ---
+sed 's/reg = <0 0x11009000 0 0x1000>;/reg = <1 0x11009000 0 0x1000>;/' "$T/wrap.dts" > "$T/x.dts"
+sed -n '/^\t\tspi2: spi@11009000 {$/,/^\t\t\treg/p' "$T/wrap.dts" | grep -q 'reg = <0 0x11009000 0 0x1000>;' ||
+    { echo "FAIL: case 39: fixture anchor"; FAIL=$((FAIL + 1)); }
+dtc -q -I dts -O dtb -o "$T/high.dtb" "$T/x.dts"
+dtb_fails "case 39" "$T/high.dtb" '/soc/spi@11009000 reg starts at 0x111009000, expected 0x11009000'
+
+# --- Case 40: a second table on spi0, beside the NAND's ---
+wrap_flash "$T/patched.dts" "$T/spi0-cs1.dtb" \
+    '/ { soc { spi@1100a000 { flash@1 { reg = <1>; partitions { compatible = "fixed-partitions"; #address-cells = <1>; #size-cells = <1>; }; }; }; }; };'
+dtb_fails "case 40" "$T/spi0-cs1.dtb" '/soc/spi@1100a000/flash@1/partitions is a partition table outside the NOR and NAND flashes'
+
+# --- Case 41: status is compared as the kernel does, by its first string ---
+CASES=$((CASES + 1))
+wrap_flash "$T/patched.dts" "$T/okay-x.dtb" '&{/soc/spi@11009000/flash@0} { status = "okay", "x"; };'
+run check-dtb "$T/okay-x.dtb"
+assert_eq 0 "$RC" "case 41: status \"okay\", \"x\" is enabled ($OUT)"
+
+# --- Case 42: a legacy ofpart table on the NOR itself (direct children with reg) ---
+wrap_flash "$T/patched.dts" "$T/legacy-nor.dtb" \
+    '&{/soc/spi@11009000/flash@0} { #address-cells = <1>; #size-cells = <1>; partition@0 { label = "all"; reg = <0x0 0x1000000>; }; };'
+dtb_fails "case 42" "$T/legacy-nor.dtb" '/soc/spi@11009000/flash@0 has a legacy partition partition@0 (reg, no compatible)'
+
+# --- Case 43: a legacy table on another SPI flash ---
+wrap_flash "$T/patched.dts" "$T/legacy-spi1.dtb" \
+    '/ { soc { spi@1100b000 { flash@1 { reg = <1>; #address-cells = <1>; #size-cells = <1>; part@0 { label = "x"; reg = <0x0 0x1000>; }; }; }; }; };'
+dtb_fails "case 43" "$T/legacy-spi1.dtb" '/soc/spi@1100b000/flash@1 has a legacy partition part@0 (reg, no compatible)'
+
+# --- Case 44: n_legacy: a CS0 nor@0 with status "okay", "x" and a legacy table
+# of renamed, writable partitions, beside a CS0 flash@0 carrying the good table ---
+cat > "$T/legacy.txt" <<'EOF'
+	nor@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		status = "okay", "x";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		partition@0 { label = "bl2"; reg = <0x0 0x40000>; };
+		partition@40000 { label = "factory-rw"; reg = <0x40000 0xa0000>; };
+		partition@e0000 { label = "secrets"; reg = <0xe0000 0x20000>; };
+		partition@100000 { label = "fip"; reg = <0x100000 0x80000>; };
+		partition@180000 { label = "rec"; reg = <0x180000 0xc80000>; };
+	};
+EOF
+flash_block "$T/patched.dts" spi2 | sed 's/compatible = "jedec,spi-nor";/compatible = "acme,nothing";/' >> "$T/legacy.txt"
+wrap_tree "$T/legacy.txt" "$T/n_legacy.dtb"
+CASES=$((CASES + 1))
+run check-dtb "$T/n_legacy.dtb"
+assert_nonzero "$RC" "case 44: n_legacy refused"
+assert_contains '/soc/spi@11009000 has 2 CS0 children' "$OUT" "case 44: two CS0 children"
+assert_contains '/soc/spi@11009000/nor@0 has a legacy partition partition@0 (reg, no compatible)' "$OUT" "case 44: the legacy table"
+
+# --- Case 45: another child of spi2 with any child node at all ---
+flash_block "$T/patched.dts" spi2 > "$T/nor2.txt"
+printf '\tflash@1 { compatible = "acme,nothing"; reg = <1>; sub { compatible = "acme,sub"; }; };\n' >> "$T/nor2.txt"
+wrap_tree "$T/nor2.txt" "$T/cs1-sub.dtb"
+dtb_fails "case 45" "$T/cs1-sub.dtb" '/soc/spi@11009000/flash@1 has child nodes but is not the NOR flash'
 
 rm -rf "$T"
 finish

@@ -218,8 +218,13 @@ SPI0_PATH = "/soc/spi@1100a000"
 
 
 def available(node):
-    # As of_device_is_available(): no status, "okay" or "ok".
-    return str(node["props"].get("status", '"okay"')).strip() in ('"okay"', '"ok"')
+    # As of_device_is_available(): no status, or a first string of "okay" or
+    # "ok" (the kernel's strcmp stops at the first NUL).
+    status = node["props"].get("status")
+    if status is None:
+        return True
+    first = re.match(r'\s*"((?:[^"\\]|\\.)*)"', str(status))
+    return bool(first) and first.group(1) in ("okay", "ok")
 
 
 def cells(node, prop):
@@ -234,9 +239,17 @@ def cells(node, prop):
 
 
 def cs0_flash(ctrl):
-    """The enabled children of an SPI controller at chip select 0."""
+    """The children of an SPI controller at chip select 0, whatever their
+    status: a second one would be a decoy whichever of them is enabled."""
     return [(n, c) for n, c in ctrl["children"]
-            if available(c) and (cells(c, "reg") or [None])[0] == 0]
+            if (cells(c, "reg") or [None])[0] == 0]
+
+
+def legacy_partitions(flash):
+    """Direct children with a reg and no compatible: ofpart reads these as a
+    legacy partition table when the flash has no partitions subnode."""
+    return [n for n, c in flash["children"]
+            if "reg" in c["props"] and "compatible" not in c["props"]]
 
 
 def nor_flash_problems(ctrl, ctrl_path):
@@ -251,20 +264,22 @@ def nor_flash_problems(ctrl, ctrl_path):
     flashes = cs0_flash(ctrl)
     chosen = None
     if len(flashes) != 1:
-        problems.append("%s has %s enabled CS0 flash (reg = <0>)"
-                        % (ctrl_path, "no" if not flashes else "more than one"))
+        problems.append("%s has %d CS0 children (reg = <0>), expected exactly one"
+                        % (ctrl_path, len(flashes)))
     else:
         name, chosen = flashes[0]
         table = child(chosen, "partitions")
+        if not available(chosen):
+            problems.append("%s/%s is disabled" % (ctrl_path, name))
         if not table:
             problems.append("%s/%s has no partitions node" % (ctrl_path, name))
         else:
             table_path = "%s/%s/partitions" % (ctrl_path, name)
             problems += table_problems(table)
     for name, node in ctrl["children"]:
-        if node is not chosen and child(node, "partitions"):
-            problems.append("%s/%s has a partitions node but is not the enabled "
-                            "CS0 flash" % (ctrl_path, name))
+        if node is not chosen and node["children"]:
+            problems.append("%s/%s has child nodes but is not the NOR flash"
+                            % (ctrl_path, name))
     return table_path, problems
 
 
@@ -322,8 +337,14 @@ def dtb_problems(dtb):
     if len(nand) == 1 and child(nand[0][1], "partitions"):
         allowed.add("%s/%s/partitions" % (SPI0_PATH, nand[0][0]))
 
-    # Any other partition table could be the one that binds, whatever it holds.
+    # Any other partition table could be the one that binds, whatever it holds;
+    # so could a legacy table of bare partition nodes on any SPI flash.
     for path, node in walk(tree):
+        if path.rsplit("/", 1)[-1].startswith("spi@"):
+            for name, flash in node["children"]:
+                for part in legacy_partitions(flash):
+                    problems.append("%s/%s has a legacy partition %s (reg, no "
+                                    "compatible)" % (path, name, part))
         is_table = ('"fixed-partitions"' in compatible(node)
                     or path.rsplit("/", 1)[-1] == "partitions")
         if is_table and path not in allowed:
