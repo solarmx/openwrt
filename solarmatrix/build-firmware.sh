@@ -206,6 +206,20 @@ text = re.sub(r'(&spi1\s*\{[^}]*)(status\s*=\s*"okay";\s*)(\};)',
 	};
 \3''', text, flags=re.S)
 
+# factory keeps its MACs and WiFi calibration read-only in 0x0-0x9ffff of the
+# partition; the free, erased tail (0xa0000-0xbffff, measured) becomes
+# factory-secrets, written once by the provisioning tool. The nvmem cells all
+# sit in the first 0x1000 bytes, so shrinking the partition moves none of them.
+text, n_factory = re.subn(
+    r'(label\s*=\s*"factory";\s*reg\s*=\s*<)0x40000 0xc0000(>;)',
+    r'\g<1>0x40000 0xa0000\2', text)
+text, n_secrets = re.subn(
+    r'(\n(\t+)partition@100000 \{\n\t+label = "fip-nor";)',
+    lambda m: ('\n%spartition@e0000 {\n%s\tlabel = "factory-secrets";\n'
+               '%s\treg = <0xe0000 0x20000>;\n%s};\n' % ((m.group(2),) * 4))
+              + m.group(1),
+    text, count=1)
+
 path.write_text(text)
 
 problems = []
@@ -217,6 +231,10 @@ if "mikrobus-reset" in text:
     problems.append("mikrobus-reset gpio-export was not removed")
 if re.search(r'&uart2\s*\{[^{}]*?status\s*=\s*"okay"', text, flags=re.S):
     problems.append("uart2 is still enabled and will collide with SPI1")
+if n_factory != 1:
+    problems.append("factory partition was not shrunk to 0x40000 0xa0000")
+if n_secrets != 1 or 'label = "factory-secrets"' not in text:
+    problems.append("factory-secrets partition was not added before fip-nor")
 
 if problems:
     sys.stderr.write("ERROR: DTS patch did not apply cleanly to %s:\n" % tag)
@@ -225,7 +243,8 @@ if problems:
     sys.stderr.write("  The upstream DTS likely changed shape in this release.\n")
     raise SystemExit(1)
 
-print("Verified: spidev@0 added, mikrobus-reset removed, uart2 disabled")
+print("Verified: spidev@0 added, mikrobus-reset removed, uart2 disabled, "
+      "factory split into factory + factory-secrets")
 PY
 
 step "Writing .config for OpenWRT One (mediatek/filogic)"
