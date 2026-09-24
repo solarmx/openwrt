@@ -63,68 +63,45 @@ require changing the hardcoded `.config` in `build-firmware.sh`.
 
 ## Device hardening
 
-`solarmatrix/files/` is copied verbatim into the rootfs. It carries the two
-scripts that keep root off the network:
+`solarmatrix/files/` is copied verbatim into the rootfs. The access policy is
+set by one boot script, with two static files as a second layer:
 
-| File | When it runs | What it does |
-|------|--------------|--------------|
-| `etc/uci-defaults/99-solarmatrix-hardening` | On every boot that follows a configuration wipe — after a flash, after `firstboot`, and after a 5-second reset-button press | Binds SSH to `br-lan`, disables `uhttpd`, and then decides the device's auth posture from what the NVMe holds (below). |
-| `sbin/solarmatrix-harden-ssh` | From the boot script, as the provisioning tool's last step, and by hand after any recovery | Sets `PasswordAuth='off'` and `RootPasswordAuth='off'`, reads them back, and restarts dropbear. After this the device accepts no password over SSH. |
+| File | What it does |
+|------|--------------|
+| `etc/uci-defaults/99-solarmatrix-hardening` | Runs on every boot that follows a configuration wipe (after a flash, `firstboot` or a 5-second reset-button press), and on every boot of the NOR recovery system, which is an initramfs. Sets the posture below from the `factory-secrets` state (see [Factory secrets](#factory-secrets)). |
+| `etc/inittab` | The stock file without its `askconsole` line, so the serial console offers no login. |
+| `etc/solarmatrix/provisioning.pub` | Public half of the provisioning key. The private half stays on the provisioning host and is never committed. |
+| `etc/security-model` | The note on what the device is, and is not, hardened against. |
 
-### Why the boot script reads the NVMe
+The posture, applied before dropbear (`START=19`) binds a socket:
 
-`/etc/config/dropbear` and `/etc/shadow` are both **overlay** files. A five-second
-press of the reset button runs `factoryreset -y` (`/etc/rc.button/reset`), which
-wipes the overlay — taking the hardening *and* the root password with it. Left
-alone, that would leave a provisioned device with password authentication back
-on and no root password at all, and dropbear accepts the `none` method for root
-with an empty hash (`600-allow-blank-root-password.patch`). In a shared
-electrical room, the people who can reach that button are the threat.
+| Boot medium | `factory-secrets` | SSH |
+|---|---|---|
+| NAND | any | dropbear disabled, `authorized_keys` empty |
+| NOR | `empty` | key-only on `lan`; `authorized_keys` = the provisioning key |
+| NOR | `valid` | key-only on `lan`; `authorized_keys` = the payload's `ssh_keys` |
+| NOR | `corrupt`, or `valid` with no keys or JSON that does not parse | key-only on `lan`, `authorized_keys` empty, logged at `daemon.crit` |
 
-The NVMe survives every such wipe, so it is the authority on what the device is:
+The script tells NOR from NAND by the last `/` entry in `/proc/mounts`: `rootfs`
+or `tmpfs` is the NOR initramfs, anything else counts as NAND, so a wrong guess
+disables SSH rather than enabling it. It never falls back to the provisioning
+key once `factory-secrets` holds anything.
 
-| NVMe state | Posture applied before dropbear binds |
-|---|---|
-| No `config.json` | Unprovisioned. Root left open so the provisioning tool can reach it; both WiFi APs forced down so that window is wired-only. |
-| `config.json`, no `.provisioned` | Mid-provisioning. Root password applied from `config.json`; password auth stays on, because the provisioning run needs it over the LAN. |
-| `config.json` + `.provisioned` | A live unit. Root password applied **and** password auth disabled. |
+On every boot, root's password field in `/etc/shadow` is set to `*`, which matches
+no password, and `system.@system[0].ttylogin=1` is set. `uhttpd` is disabled if
+present, because it binds `0.0.0.0` and cannot be restricted to the LAN.
 
-`.provisioned` is written by the provisioning tool over the last SSH session
-there will be, immediately before it locks the device — it cannot be written
-afterwards, because by then nothing can log in. The run then reconnects and
-refuses to report success unless a root password is actually refused, so the
-marker means "provisioning reached the end" while the run's exit status is what
-says the device is fit to ship.
+WiFi: with a `valid` state, every `wifi-iface` gets the payload's `ssid` and
+`key`, `encryption=psk2` and `disabled=0`. Otherwise every AP is set to
+`disabled=1`.
 
-The script **fails closed**: if `config.json` is present but the password cannot
-be applied, password authentication goes off anyway. A device that needs failsafe
-to recover is recoverable; a passwordless rootable one in a shared building is
-not.
+Secrets never reach argv, where `ps` would show them: the JSON reaches
+`jsonfilter` on stdin, and each UCI value reaches `uci batch` on stdin. Values
+are never logged, only the names of the settings.
 
-Ordering makes this work: uci-defaults run from `/etc/init.d/boot` (`START=10`),
-before dropbear (`START=19`) has bound a socket. The NVMe is not mounted that
-early — `/etc/init.d/solarmatrix-mount` is `START=20` — so the script mounts it
-read-only itself and unmounts it again.
-
-Every concern is independent and reads its result back; anything that did not
+Each concern is independent and reads its result back. Anything that did not
 take is logged at `daemon.crit` and makes the script exit non-zero, which leaves
-it in place to run again on the next boot. It runs unattended with nobody
-reading its exit code, so failing silently open is the one outcome it must not
-have.
-
-The device keeps a unique, strong root password — generated per device during
-provisioning, written to `/solarmatrix/config.json`, and applied to the account.
-It is simply not accepted from the network, and it is never printed. It reaches
-`chpasswd` on stdin, never in argv, so it does not appear in `ps` output.
-
-**Recovery.** With no password authentication, root is reached through OpenWRT
-failsafe mode, which requires physical access. Failsafe is unaffected by any of
-the above: `/lib/preinit/99_10_failsafe_dropbear` starts its own dropbear with
-an explicit command line and a throwaway host key, and
-`/lib/preinit/99_10_failsafe_login` opens a serial console shell — neither
-reads `/etc/config/dropbear`. The full runbook lives in
-[`docs/RECOVERY.md`](https://github.com/solar-matrix/provisioning/blob/main/docs/RECOVERY.md)
-in the provisioning repository.
+it in place to run again on the next boot.
 
 ## Factory secrets
 
@@ -165,8 +142,10 @@ The scripts in this directory are covered by shell test suites, run directly:
 bash solarmatrix/secrets_test.sh
 ```
 
-`hardening_test.sh` runs the hardening scripts against a fake `uci` and `service`
-on `PATH` and asserts on the resulting UCI state, so it needs no device.
+`hardening_test.sh` runs the boot script against fake `uci`, `service`, `logger`
+and `jsonfilter` on `PATH`, a fake `factory-secrets` image and a fake
+`/proc/mounts`, and asserts on the resulting UCI state, `authorized_keys`,
+shadow file, log and recorded argv, so it needs no device.
 `secrets_test.sh` builds partition images in a temp directory and checks
 `secrets.sh` classifies each one correctly, so it needs no device either.
 Shared assertions and image builders live in `testlib.sh`.

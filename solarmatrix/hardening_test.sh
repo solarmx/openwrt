@@ -1,397 +1,240 @@
 #!/bin/bash
-# Tests for the SolarMatrix device hardening scripts shipped in
-# solarmatrix/files/. Each case builds a sandbox with fake uci/service/logger/
-# mount/jsonfilter/chpasswd binaries on PATH, runs a script, and asserts on the
-# resulting UCI state, log lines and side effects. No device needed.
-set -euo pipefail
-
+# Tests for files/etc/uci-defaults/99-solarmatrix-hardening. Each case builds a
+# sandbox with fake uci/service/logger/jsonfilter on PATH, a fake
+# factory-secrets image and a fake /proc/mounts, runs the script, and asserts
+# on the result.
+set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BOOT_HARDENING="$HERE/files/etc/uci-defaults/99-solarmatrix-hardening"
-HARDEN_SSH="$HERE/files/sbin/solarmatrix-harden-ssh"
+. "$HERE/testlib.sh"
+SCRIPT="$HERE/files/etc/uci-defaults/99-solarmatrix-hardening"
+LIBDIR="$HERE/files/lib/solarmatrix"
 
-FAIL=0
-CASES=0
+NVME_KEY="$(printf 'cd%.0s' $(seq 32))"
+KEYS_JSON='{"v":1,"serial":"SM-1","ssh_keys":["ssh-ed25519 AAAA unit-a","ssh-ed25519 BBBB unit-b"],"wifi":{"ssid":"SolarMatrix-1","key":"s3cret-wifi"},"nvme_key":"'"$NVME_KEY"'"}'
 
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    if [ "$expected" != "$actual" ]; then
-        echo "FAIL: $msg"
-        echo "  expected: $expected"
-        echo "  actual:   $actual"
-        FAIL=$((FAIL + 1))
-    fi
-}
+# /proc/mounts as the two boot media show it. The NOR recovery system is an
+# initramfs; NAND mounts an overlay over the squashfs.
+MOUNTS_NOR='rootfs / rootfs rw 0 0
+proc /proc proc rw,nosuid,nodev,noexec,noatime 0 0'
+MOUNTS_NOR_TMPFS='tmpfs / tmpfs rw,nosuid,noatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,noatime 0 0'
+MOUNTS_NAND='/dev/root /rom squashfs ro,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,noatime 0 0
+overlayfs:/overlay / overlay rw,noatime,lowerdir=/,upperdir=/overlay/upper 0 0'
 
-assert_contains() {
-    local needle="$1" haystack="$2" msg="$3"
-    case "$haystack" in
-        *"$needle"*) ;;
-        *)
-            echo "FAIL: $msg"
-            echo "  needle:   $needle"
-            echo "  haystack: $haystack"
-            FAIL=$((FAIL + 1))
-            ;;
-    esac
-}
-
-assert_not_contains() {
-    local needle="$1" haystack="$2" msg="$3"
-    case "$haystack" in
-        *"$needle"*)
-            echo "FAIL: $msg"
-            echo "  unexpected needle: $needle"
-            echo "  haystack:          $haystack"
-            FAIL=$((FAIL + 1))
-            ;;
-    esac
-}
-
-assert_nonzero() {
-    local rc="$1" msg="$2"
-    if [ "$rc" -eq 0 ]; then
-        echo "FAIL: $msg (exited 0)"
-        FAIL=$((FAIL + 1))
-    fi
-}
-
-# Builds a sandbox in $1 with fake tools on PATH.
-#   $1/uci.state    UCI state as "key=value" lines
-#   $1/uci.commits  committed package names
-#   $1/service.log  service invocations
-#   $1/logger.log   logger invocations
-#   $1/chpasswd.log what was piped to chpasswd
-#   $1/harden.log   invocations of the (faked) harden-ssh script
-#   $1/nvme/        what the NVMe presents once "mounted"
 make_sandbox() {
     local t="$1"
-    mkdir -p "$t/bin" "$t/nvme"
-    : > "$t/uci.state"
-    : > "$t/uci.commits"
-    : > "$t/service.log"
-    : > "$t/logger.log"
-    : > "$t/chpasswd.log"
-    : > "$t/harden.log"
+    mkdir -p "$t/bin" "$t/etc/dropbear"
+    : > "$t/uci.state"; : > "$t/service.log"; : > "$t/logger.log"; : > "$t/argv.log"
+    printf 'root:$1$old$hash:19000:0:99999:7:::\ndaemon:*:0:0:99999:7:::\n' > "$t/shadow"
+    printf 'ssh-ed25519 PPPP provisioning\n' > "$t/provisioning.pub"
+    printf 'ssh-ed25519 STALE left-over\n' > "$t/etc/dropbear/authorized_keys"
+    make_empty_secrets "$t/secrets"
 
+    # Every call's argv goes to ARGV_LOG, so a test can prove no secret was
+    # ever visible in ps.
     cat > "$t/bin/uci" <<'UCI'
 #!/bin/sh
+printf 'uci %s\n' "$*" >> "$ARGV_LOG"
 while [ "$1" = "-q" ]; do shift; done
 cmd="$1"; shift
+uci_set() {
+    [ "$1" = "${UCI_FAIL_KEY:-}" ] && return 0
+    awk -F= -v k="$1" '$1!=k' "$UCI_STATE" > "$UCI_STATE.new"; mv "$UCI_STATE.new" "$UCI_STATE"
+    printf '%s=%s\n' "$1" "$2" >> "$UCI_STATE"
+}
 case "$cmd" in
-set)
-    key="${1%%=*}"; val="${1#*=}"
-    [ "${UCI_READONLY:-0}" = "1" ] && exit 0
-    [ "$key" = "${UCI_FAIL_KEY:-}" ] && exit 0
-    awk -F= -v k="$key" '$1!=k' "$UCI_STATE" > "$UCI_STATE.new"
-    mv "$UCI_STATE.new" "$UCI_STATE"
-    printf '%s=%s\n' "$key" "$val" >> "$UCI_STATE"
-    ;;
-get)
-    awk -F= -v k="$1" '$1==k { sub(/^[^=]*=/, ""); print; found=1 } END { exit !found }' "$UCI_STATE" || exit 1
-    ;;
-show)
-    grep -q "^$1\." "$UCI_STATE" || exit 1
-    grep "^$1\." "$UCI_STATE"
-    ;;
-commit)
-    printf '%s\n' "$1" >> "$UCI_COMMITS"
-    ;;
-*)
-    echo "fake uci: unsupported command '$cmd'" >&2
-    exit 2
-    ;;
+set)   uci_set "${1%%=*}" "${1#*=}" ;;
+batch) while IFS= read -r line; do
+           case "$line" in
+           set\ *) kv="${line#set }"; key="${kv%%=*}"; val="${kv#*=}"
+                   val="${val#\'}"; val="${val%\'}"
+                   val="$(printf '%s' "$val" | sed "s/'\\\\''/'/g")"
+                   uci_set "$key" "$val" ;;
+           *) exit 2 ;;
+           esac
+       done ;;
+get)  awk -F= -v k="$1" '$1==k { sub(/^[^=]*=/, ""); print; f=1 } END { exit !f }' "$UCI_STATE" || exit 1 ;;
+show) grep -q "^$1\." "$UCI_STATE" || exit 1; grep "^$1\." "$UCI_STATE" ;;
+commit) ;;
+*) exit 2 ;;
 esac
-exit 0
 UCI
-
-    cat > "$t/bin/service" <<'SVC'
-#!/bin/sh
-printf '%s\n' "$*" >> "$SERVICE_LOG"
-[ "$*" = "${SERVICE_FAIL:-}" ] && exit 1
-exit 0
-SVC
-
-    cat > "$t/bin/logger" <<'LOG'
-#!/bin/sh
-printf '%s\n' "$*" >> "$LOGGER_LOG"
-exit 0
-LOG
-
-    # The script mounts read-only and expects the NVMe contents to appear at the
-    # mountpoint; the sandbox mountpoint is already populated, so this only has
-    # to succeed or fail on command.
-    cat > "$t/bin/mount" <<'MNT'
-#!/bin/sh
-[ "${MOUNT_FAIL:-0}" = "1" ] && exit 1
-exit 0
-MNT
-
-    cat > "$t/bin/umount" <<'UMNT'
-#!/bin/sh
-exit 0
-UMNT
-
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$SERVICE_LOG"\n' > "$t/bin/service"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$LOGGER_LOG"\n' > "$t/bin/logger"
+    install_fake_jsonfilter "$t/bin"
+    mv "$t/bin/jsonfilter" "$t/bin/jsonfilter.real"
+    # Real jsonfilter reads stdin when given neither -s nor -i.
     cat > "$t/bin/jsonfilter" <<'JF'
 #!/bin/sh
-# Supports the one form the script uses: jsonfilter -i FILE -e '@.field'
-file=''; expr=''
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -i) file="$2"; shift 2 ;;
-        -e) expr="$2"; shift 2 ;;
-        *) shift ;;
-    esac
-done
-field="${expr#@.}"
-val="$(sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file")"
-[ -n "$val" ] || exit 1
-printf '%s\n' "$val"
+printf 'jsonfilter %s\n' "$*" >> "$ARGV_LOG"
+real="$(dirname "$0")/jsonfilter.real"
+case " $* " in *" -s "*|*" -i "*) exec "$real" "$@" ;; esac
+exec "$real" -s "$(cat)" "$@"
 JF
-
-    cat > "$t/bin/chpasswd" <<'CHP'
-#!/bin/sh
-cat >> "$CHPASSWD_LOG"
-[ "${CHPASSWD_FAIL:-0}" = "1" ] && exit 1
-exit 0
-CHP
-
-    # Faked so the boot script's decision is what is under test here; the real
-    # harden-ssh script has its own cases below.
-    cat > "$t/bin/solarmatrix-harden-ssh" <<'HRD'
-#!/bin/sh
-printf 'called\n' >> "$HARDEN_LOG"
-exit 0
-HRD
-
     chmod 755 "$t"/bin/*
 }
 
+# run_boot DIR MOUNTS [COMMAND-PREFIX...]
 run_boot() {
-    local t="$1"; shift
-    env PATH="$t/bin:$PATH" \
-        UCI_STATE="$t/uci.state" \
-        UCI_COMMITS="$t/uci.commits" \
-        SERVICE_LOG="$t/service.log" \
-        LOGGER_LOG="$t/logger.log" \
-        CHPASSWD_LOG="$t/chpasswd.log" \
-        HARDEN_LOG="$t/harden.log" \
-        SOLARMATRIX_NVME_DEV="$t/nvme.dev" \
-        SOLARMATRIX_NVME_MNT="$t/nvme" \
-        SOLARMATRIX_NVME_WAIT=1 \
-        "$@" "$BOOT_HARDENING"
+    local t="$1" mounts="$2"; shift 2
+    printf '%s\n' "$mounts" > "$t/mounts"
+    env PATH="$t/bin:$PATH" UCI_STATE="$t/uci.state" SERVICE_LOG="$t/service.log" \
+        LOGGER_LOG="$t/logger.log" ARGV_LOG="$t/argv.log" SOLARMATRIX_LIB="$LIBDIR" \
+        SOLARMATRIX_SECRETS_DEV="$t/secrets" SOLARMATRIX_MOUNTS="$t/mounts" \
+        SOLARMATRIX_SHADOW="$t/shadow" SOLARMATRIX_AUTH_KEYS="$t/etc/dropbear/authorized_keys" \
+        SOLARMATRIX_PROVISIONING_KEY="$t/provisioning.pub" "$@" sh "$SCRIPT"
 }
 
-run_harden() {
-    local t="$1"; shift
-    env PATH="$t/bin:$PATH" \
-        UCI_STATE="$t/uci.state" \
-        UCI_COMMITS="$t/uci.commits" \
-        SERVICE_LOG="$t/service.log" \
-        LOGGER_LOG="$t/logger.log" \
-        "$@" "$HARDEN_SSH"
-}
+wifi_sections() { printf 'wireless.default_radio0=wifi-iface\nwireless.default_radio1=wifi-iface\n' >> "$1/uci.state"; }
 
-# Marks the sandbox NVMe as present and provisioned to the given degree.
-nvme_present() { touch "$1/nvme.dev"; }
-nvme_config()  { printf '{\n  "serial": "s",\n  "root_password": "%s"\n}\n' "$2" > "$1/nvme/config.json"; }
-nvme_marker()  { touch "$1/nvme/.provisioned"; }
-
-# =============== boot-time hardening script ===============
-
-# --- Case 1: binds dropbear to the LAN bridge ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-RC=0
-run_boot "$T" >/dev/null 2>&1 || RC=$?
+# --- Case 1: NAND never starts dropbear, even when provisioned ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$KEYS_JSON"
+RC=0; run_boot "$T" "$MOUNTS_NAND" >/dev/null 2>&1 || RC=$?
 assert_eq 0 "$RC" "case 1: exits 0"
-assert_contains 'dropbear.@dropbear[0].DirectInterface=lan' "$(cat "$T/uci.state")" \
-    "case 1: dropbear bound to the lan interface"
-assert_contains 'dropbear' "$(cat "$T/uci.commits")" "case 1: dropbear config committed"
+assert_contains 'dropbear.@dropbear[0].enable=0' "$(cat "$T/uci.state")" "case 1: dropbear disabled on NAND"
+assert_eq '' "$(cat "$T/etc/dropbear/authorized_keys")" "case 1: no keys on NAND"
 rm -rf "$T"
 
-# --- Case 2: an unprovisioned device keeps password auth on ---
-# The provisioning tool still has to reach root over the LAN.
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-run_boot "$T" >/dev/null 2>&1 || true
-assert_not_contains 'PasswordAuth' "$(cat "$T/uci.state")" \
-    "case 2: password authentication untouched with no config.json"
-assert_eq '' "$(cat "$T/harden.log")" "case 2: harden-ssh not run on an unprovisioned device"
-rm -rf "$T"
-
-# --- Case 3: uhttpd taken off the wildcard socket ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-printf 'uhttpd.main.listen_http=0.0.0.0:80\n' >> "$T/uci.state"
-run_boot "$T" >/dev/null 2>&1 || true
-assert_contains 'uhttpd disable' "$(cat "$T/service.log")" "case 3: uhttpd disabled when present"
-rm -rf "$T"
-
-# --- Case 4: succeeds on an image without uhttpd ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-RC=0
-run_boot "$T" >/dev/null 2>&1 || RC=$?
-assert_eq 0 "$RC" "case 4: exits 0 without uhttpd installed"
-assert_not_contains 'uhttpd' "$(cat "$T/service.log")" "case 4: no service touched without uhttpd"
-rm -rf "$T"
-
-# --- Case 5: a setting that does not take is logged, and does not skip the rest ---
-# This script runs unattended with nobody reading its exit code, so failing
-# silently open is the one outcome it must never have.
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-printf 'uhttpd.main.listen_http=0.0.0.0:80\n' >> "$T/uci.state"
-RC=0
-run_boot "$T" env UCI_FAIL_KEY='dropbear.@dropbear[0].DirectInterface' >/dev/null 2>&1 || RC=$?
-assert_nonzero "$RC" "case 5: exits non-zero so the script runs again next boot"
-LOGGED="$(cat "$T/logger.log")"
-assert_contains 'daemon.crit' "$LOGGED" "case 5: failure logged at daemon.crit"
-assert_contains 'DirectInterface' "$LOGGED" "case 5: log names the setting that did not take"
-assert_contains 'uhttpd disable' "$(cat "$T/service.log")" \
-    "case 5: the uhttpd concern still runs after the dropbear concern failed"
-rm -rf "$T"
-
-# --- Case 6: the provisioning window is wired-only ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-printf 'wireless.default_radio0=wifi-iface\nwireless.default_radio1=wifi-iface\n' >> "$T/uci.state"
-run_boot "$T" >/dev/null 2>&1 || true
+# --- Case 2: NOR, unprovisioned: only the provisioning key ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+RC=0; run_boot "$T" "$MOUNTS_NOR" >/dev/null 2>&1 || RC=$?
 STATE="$(cat "$T/uci.state")"
-assert_contains 'wireless.default_radio0.disabled=1' "$STATE" "case 6: 2.4 GHz AP down"
-assert_contains 'wireless.default_radio1.disabled=1' "$STATE" "case 6: 5 GHz AP down"
+assert_eq 0 "$RC" "case 2: exits 0"
+assert_contains 'dropbear.@dropbear[0].enable=1' "$STATE" "case 2: dropbear on NOR"
+assert_contains 'dropbear.@dropbear[0].PasswordAuth=off' "$STATE" "case 2: password auth off"
+assert_contains 'dropbear.@dropbear[0].RootPasswordAuth=off' "$STATE" "case 2: root password auth off"
+assert_contains 'dropbear.@dropbear[0].DirectInterface=lan' "$STATE" "case 2: bound to lan"
+assert_eq 'ssh-ed25519 PPPP provisioning' "$(cat "$T/etc/dropbear/authorized_keys")" "case 2: provisioning key only"
 rm -rf "$T"
 
-# --- Case 7: mid-provisioning -- password applied, SSH still open ---
-# Closes the window between `sysupgrade -n` (which wipes /etc/shadow) and the
-# factory reset that used to be the first thing to set a root password.
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-nvme_present "$T"; nvme_config "$T" "correct-horse-battery-staple"
-RC=0
-run_boot "$T" >/dev/null 2>&1 || RC=$?
+# --- Case 3: NOR, provisioned: the unit's own keys, not the provisioning key ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$KEYS_JSON"
+RC=0; run_boot "$T" "$MOUNTS_NOR" >/dev/null 2>&1 || RC=$?
+KEYS="$(cat "$T/etc/dropbear/authorized_keys")"
+assert_eq 0 "$RC" "case 3: exits 0"
+assert_eq "$(printf 'ssh-ed25519 AAAA unit-a\nssh-ed25519 BBBB unit-b')" "$KEYS" "case 3: exactly the unit's keys"
+assert_not_contains 'PPPP' "$KEYS" "case 3: provisioning key refused once provisioned"
+rm -rf "$T"
+
+# --- Case 4: NOR, corrupt secrets: no key at all, logged, APs down ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$KEYS_JSON"; wifi_sections "$T"
+printf 'X' | dd of="$T/secrets" bs=1 seek=100 conv=notrunc 2>/dev/null
+RC=0; run_boot "$T" "$MOUNTS_NOR" >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 4: exits non-zero"
+assert_eq '' "$(cat "$T/etc/dropbear/authorized_keys")" "case 4: no key accepted"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 4: logged at daemon.crit"
+assert_contains 'wireless.default_radio0.disabled=1' "$(cat "$T/uci.state")" "case 4: APs down"
+assert_contains 'wireless.default_radio1.disabled=1' "$(cat "$T/uci.state")" "case 4: both APs down"
+rm -rf "$T"
+
+# --- Case 5: NOR, provisioned with zero keys: no fallback to the provisioning key ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+make_secrets "$T/secrets" '{"v":1,"serial":"SM-1","ssh_keys":[]}'
+RC=0; run_boot "$T" "$MOUNTS_NOR" >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 5: exits non-zero"
+assert_eq '' "$(cat "$T/etc/dropbear/authorized_keys")" "case 5: nothing accepted"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 5: logged at daemon.crit"
+assert_contains 'no SSH keys' "$(cat "$T/logger.log")" "case 5: log says why"
+rm -rf "$T"
+
+# --- Case 6: root password field becomes *, other accounts untouched ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+run_boot "$T" "$MOUNTS_NAND" >/dev/null 2>&1 || true
+assert_eq 'root:*:19000:0:99999:7:::' "$(sed -n 1p "$T/shadow")" "case 6: root field is *"
+assert_eq 'daemon:*:0:0:99999:7:::' "$(sed -n 2p "$T/shadow")" "case 6: other lines unchanged"
+assert_eq 2 "$(wc -l < "$T/shadow" | tr -d ' ')" "case 6: no lines added or lost"
+rm -rf "$T"
+
+# --- Case 7: ttylogin forced on; NAND unprovisioned has no SSH either ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+RC=0; run_boot "$T" "$MOUNTS_NAND" >/dev/null 2>&1 || RC=$?
 assert_eq 0 "$RC" "case 7: exits 0"
-assert_eq 'root:correct-horse-battery-staple' "$(cat "$T/chpasswd.log")" \
-    "case 7: root password applied from config.json"
-assert_eq '' "$(cat "$T/harden.log")" "case 7: SSH left open for the rest of the provisioning run"
-assert_not_contains 'wireless' "$(cat "$T/uci.state")" \
-    "case 7: WiFi left alone once there is a password protecting the device"
+assert_contains 'system.@system[0].ttylogin=1' "$(cat "$T/uci.state")" "case 7: ttylogin=1"
+assert_contains 'dropbear.@dropbear[0].enable=0' "$(cat "$T/uci.state")" "case 7: dropbear disabled on NAND"
+assert_eq '' "$(cat "$T/etc/dropbear/authorized_keys")" "case 7: no keys on NAND"
 rm -rf "$T"
 
-# --- Case 8: a provisioned device locks SSH again after a config wipe ---
-# This is the five-second reset-button case: factoryreset -y wipes the overlay,
-# taking /etc/config/dropbear and /etc/shadow with it.
-CASES=$((CASES + 1))
+# --- Case 8: provisioned WiFi from the secrets; the key never reaches the log ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$KEYS_JSON"; wifi_sections "$T"
+OUT=$(run_boot "$T" "$MOUNTS_NAND" 2>&1) || true
+STATE="$(cat "$T/uci.state")"
+for r in 0 1; do
+    assert_contains "wireless.default_radio$r.ssid=SolarMatrix-1" "$STATE" "case 8: radio$r SSID"
+    assert_contains "wireless.default_radio$r.key=s3cret-wifi" "$STATE" "case 8: radio$r key"
+    assert_contains "wireless.default_radio$r.encryption=psk2" "$STATE" "case 8: radio$r WPA2"
+    assert_contains "wireless.default_radio$r.disabled=0" "$STATE" "case 8: radio$r AP up"
+done
+assert_not_contains 's3cret-wifi' "$(cat "$T/logger.log") $OUT" "case 8: WiFi key never logged"
+rm -rf "$T"
+
+# --- Case 9: unprovisioned: WiFi APs down ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; wifi_sections "$T"
+run_boot "$T" "$MOUNTS_NAND" >/dev/null 2>&1 || true
+assert_contains 'wireless.default_radio0.disabled=1' "$(cat "$T/uci.state")" "case 9: APs down"
+assert_contains 'wireless.default_radio1.disabled=1' "$(cat "$T/uci.state")" "case 9: both APs down"
+rm -rf "$T"
+
+# --- Case 10: a setting that does not take is logged and does not skip the rest ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+RC=0; run_boot "$T" "$MOUNTS_NAND" env UCI_FAIL_KEY='system.@system[0].ttylogin' >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 10: exits non-zero so it runs again next boot"
+assert_contains 'ttylogin' "$(cat "$T/logger.log")" "case 10: log names the setting"
+assert_contains 'dropbear.@dropbear[0].enable=0' "$(cat "$T/uci.state")" "case 10: later concerns still ran"
+rm -rf "$T"
+
+# --- Case 11: uhttpd disabled when present ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+printf 'uhttpd.main.listen_http=0.0.0.0:80\n' >> "$T/uci.state"
+run_boot "$T" "$MOUNTS_NAND" >/dev/null 2>&1 || true
+assert_contains 'uhttpd disable' "$(cat "$T/service.log")" "case 11: uhttpd disabled"
+rm -rf "$T"
+
+# --- Case 12: hash-valid image whose JSON does not parse: no key, no fallback, APs down ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; wifi_sections "$T"
+make_secrets "$T/secrets" '{"v":1,"ssh_keys":["ssh-ed25519 AAAA unit-a"],"wifi":{"ssid":"SolarMatrix-1","key":"s3cret-wifi"'
+RC=0; OUT=$(run_boot "$T" "$MOUNTS_NOR" 2>&1) || RC=$?
+STATE="$(cat "$T/uci.state")"
+assert_nonzero "$RC" "case 12: exits non-zero"
+assert_eq '' "$(cat "$T/etc/dropbear/authorized_keys")" "case 12: no key accepted"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 12: logged at daemon.crit"
+assert_contains 'wireless.default_radio0.disabled=1' "$STATE" "case 12: APs down"
+assert_not_contains 'wireless.default_radio0.ssid' "$STATE" "case 12: no SSID applied"
+assert_not_contains 's3cret-wifi' "$(cat "$T/logger.log") $OUT" "case 12: WiFi key never logged"
+rm -rf "$T"
+
+# --- Case 13: no secret is ever passed on a command line ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$KEYS_JSON"; wifi_sections "$T"
+run_boot "$T" "$MOUNTS_NOR" >/dev/null 2>&1 || true
+ARGV="$(cat "$T/argv.log")"
+assert_contains 'wireless.default_radio0.key=s3cret-wifi' "$(cat "$T/uci.state")" "case 13: key applied"
+assert_not_contains 's3cret-wifi' "$ARGV" "case 13: WiFi key never in argv"
+assert_not_contains "$NVME_KEY" "$ARGV" "case 13: NVMe key never in argv"
+rm -rf "$T"
+
+# --- Case 14: a value with a single quote survives uci batch quoting ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; wifi_sections "$T"
+make_secrets "$T/secrets" '{"v":1,"ssh_keys":["ssh-ed25519 AAAA unit-a"],"wifi":{"ssid":"Jo'"'"'s Solar","key":"it'"'"'s-a-key"}}'
+RC=0; run_boot "$T" "$MOUNTS_NAND" >/dev/null 2>&1 || RC=$?
+assert_eq 0 "$RC" "case 14: exits 0"
+assert_contains "wireless.default_radio0.ssid=Jo's Solar" "$(cat "$T/uci.state")" "case 14: SSID with quote"
+assert_contains "wireless.default_radio1.key=it's-a-key" "$(cat "$T/uci.state")" "case 14: key with quote"
+rm -rf "$T"
+
+# --- Case 15: boot medium is read from /proc/mounts, failing towards NAND ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+run_boot "$T" "$MOUNTS_NOR_TMPFS" >/dev/null 2>&1 || true
+assert_contains 'dropbear.@dropbear[0].enable=1' "$(cat "$T/uci.state")" "case 15: tmpfs root is NOR"
+rm -rf "$T"
 T=$(mktemp -d); make_sandbox "$T"
-nvme_present "$T"; nvme_config "$T" "correct-horse-battery-staple"; nvme_marker "$T"
-RC=0
-run_boot "$T" >/dev/null 2>&1 || RC=$?
-assert_eq 0 "$RC" "case 8: exits 0"
-assert_eq 'root:correct-horse-battery-staple' "$(cat "$T/chpasswd.log")" \
-    "case 8: root password restored from config.json"
-assert_contains 'called' "$(cat "$T/harden.log")" \
-    "case 8: password authentication disabled again"
+printf '%s\n' "$MOUNTS_NAND" > "$T/mounts"
+env PATH="$T/bin:$PATH" UCI_STATE="$T/uci.state" SERVICE_LOG="$T/service.log" \
+    LOGGER_LOG="$T/logger.log" ARGV_LOG="$T/argv.log" SOLARMATRIX_LIB="$LIBDIR" \
+    SOLARMATRIX_SECRETS_DEV="$T/secrets" SOLARMATRIX_MOUNTS="$T/no-such-mounts" \
+    SOLARMATRIX_SHADOW="$T/shadow" SOLARMATRIX_AUTH_KEYS="$T/etc/dropbear/authorized_keys" \
+    SOLARMATRIX_PROVISIONING_KEY="$T/provisioning.pub" sh "$SCRIPT" >/dev/null 2>&1 || true
+assert_contains 'dropbear.@dropbear[0].enable=0' "$(cat "$T/uci.state")" "case 15: unreadable mounts is NAND"
+assert_eq '' "$(cat "$T/etc/dropbear/authorized_keys")" "case 15: unreadable mounts accepts no key"
 rm -rf "$T"
 
-# --- Case 9: fails closed when the password cannot be applied ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-nvme_present "$T"; nvme_config "$T" "correct-horse-battery-staple"
-RC=0
-run_boot "$T" env CHPASSWD_FAIL=1 >/dev/null 2>&1 || RC=$?
-assert_nonzero "$RC" "case 9: exits non-zero"
-assert_contains 'called' "$(cat "$T/harden.log")" \
-    "case 9: SSH locked rather than left open with no root password"
-assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 9: logged at daemon.crit"
-rm -rf "$T"
-
-# --- Case 10: fails closed when config.json carries no root_password ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-nvme_present "$T"; printf '{ "serial": "s" }\n' > "$T/nvme/config.json"
-RC=0
-run_boot "$T" >/dev/null 2>&1 || RC=$?
-assert_nonzero "$RC" "case 10: exits non-zero"
-assert_contains 'called' "$(cat "$T/harden.log")" "case 10: SSH locked"
-rm -rf "$T"
-
-# --- Case 11: an unmountable NVMe leaves an unprovisioned device alone ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-nvme_present "$T"
-RC=0
-run_boot "$T" env MOUNT_FAIL=1 >/dev/null 2>&1 || RC=$?
-assert_eq 0 "$RC" "case 11: exits 0"
-assert_eq '' "$(cat "$T/harden.log")" "case 11: nothing to protect, nothing locked"
-assert_eq '' "$(cat "$T/chpasswd.log")" "case 11: no password applied"
-rm -rf "$T"
-
-# =============== harden-ssh script ===============
-
-# --- Case 12: turns off root password authentication ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-RC=0
-run_harden "$T" >/dev/null 2>&1 || RC=$?
-assert_eq 0 "$RC" "case 12: exits 0"
-STATE=$(cat "$T/uci.state")
-assert_contains 'dropbear.@dropbear[0].PasswordAuth=off' "$STATE" "case 12: password auth off"
-assert_contains 'dropbear.@dropbear[0].RootPasswordAuth=off' "$STATE" "case 12: root password auth off"
-assert_contains 'dropbear.@dropbear[0].DirectInterface=lan' "$STATE" "case 12: still bound to lan"
-assert_contains 'dropbear restart' "$(cat "$T/service.log")" "case 12: dropbear restarted"
-rm -rf "$T"
-
-# --- Case 13: fails loudly when the setting does not take ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-RC=0
-OUT=$(run_harden "$T" env UCI_READONLY=1 2>&1) || RC=$?
-assert_nonzero "$RC" "case 13: exits non-zero when uci does not persist"
-assert_contains "dropbear PasswordAuth is '(unset)', expected 'off'" "$OUT" \
-    "case 13: error names the option that did not take"
-rm -rf "$T"
-
-# --- Case 14: idempotent ---
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-run_harden "$T" >/dev/null 2>&1 || true
-RC=0
-run_harden "$T" >/dev/null 2>&1 || RC=$?
-assert_eq 0 "$RC" "case 14: second run exits 0"
-assert_eq 1 "$(grep -c 'RootPasswordAuth=off' "$T/uci.state")" \
-    "case 14: option written exactly once"
-rm -rf "$T"
-
-# --- Case 15: a failed restart does not fail a correctly configured device ---
-# The boot script calls this before the lan interface is up, where dropbear's
-# init script legitimately returns non-zero. Failing here would report a device
-# as unhardened when its configuration is exactly right.
-CASES=$((CASES + 1))
-T=$(mktemp -d); make_sandbox "$T"
-RC=0
-run_harden "$T" env SERVICE_FAIL='dropbear restart' >/dev/null 2>&1 || RC=$?
-assert_eq 0 "$RC" "case 15: exits 0 when only the restart failed"
-assert_contains 'dropbear.@dropbear[0].PasswordAuth=off' "$(cat "$T/uci.state")" \
-    "case 15: settings still committed"
-assert_contains 'daemon.warn' "$(cat "$T/logger.log")" "case 15: restart failure logged"
-rm -rf "$T"
-
-# --- Case 16: neither script ever discloses a credential ---
-CASES=$((CASES + 1))
-BODY="$(cat "$BOOT_HARDENING" "$HARDEN_SSH")"
-assert_not_contains 'logger -t solarmatrix-hardening -p daemon.crit "$root_password' "$BODY" \
-    "case 16: the root password is never logged"
-assert_not_contains 'echo "$root_password' "$BODY" "case 16: the root password is never echoed"
-# It reaches chpasswd on stdin, never in argv, so it cannot show up in ps output.
-assert_contains '| chpasswd' "$BODY" \
-    'case 16: the password is piped to chpasswd'
-assert_not_contains 'chpasswd "' "$BODY" \
-    'case 16: the password is never passed to chpasswd as an argument'
-
-echo
-if [ $FAIL -eq 0 ]; then
-    echo "PASS: $CASES cases"
-    exit 0
-fi
-echo "FAILED: $FAIL assertion(s) across $CASES cases"
-exit 1
+finish

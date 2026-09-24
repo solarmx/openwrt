@@ -1,0 +1,12 @@
+SolarMatrix WohnStrom Manager -- security model
+
+This device is hardened against remote attackers and against anyone
+without tools. It is deliberately NOT hardened against physical access
+with tools: the MediaTek BootROM accepts code over the front USB-C serial
+port at power-on, and the flash can be read with a clip. Those limits
+were chosen, not overlooked.
+
+What that gives an attacker: this one unit. Every secret on it is unique
+to it, and its certificate can be revoked.
+
+Found something beyond that? Contact: kontakt@solarmatrix.eu
