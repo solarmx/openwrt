@@ -43,10 +43,13 @@ sm_secrets_dev() {
 # bytes of a capped read proves both at once: head never passes more than
 # SM_SECRETS_SIZE bytes, so a count of exactly SM_SECRETS_SIZE also means
 # nothing was short. wc prints a number, which command substitution cannot
-# strip the way it strips trailing newlines from raw data.
+# strip the way it strips trailing newlines from raw data. tr and wc run
+# with LC_ALL=C because under UTF-8 the pair 0xC3 0xBF is the character
+# '\377' and would count as erased; set per command so the caller's locale
+# stays untouched.
 _sm_secrets_erased() {
 	local ff
-	ff="$(head -c "$SM_SECRETS_SIZE" "$1" 2>/dev/null | tr -d -c '\377' | wc -c | tr -d ' ')"
+	ff="$(head -c "$SM_SECRETS_SIZE" "$1" 2>/dev/null | LC_ALL=C tr -d -c '\377' | LC_ALL=C wc -c | tr -d ' ')"
 	[ "$ff" = "$SM_SECRETS_SIZE" ]
 }
 
@@ -76,8 +79,10 @@ _sm_secrets_len() {
 	# overflowing values away from [ -gt ] and from head -c, which on BusyBox
 	# may refuse them and output nothing: the SHA-256 of nothing would then
 	# make a forged header valid.
-	case "$len" in ''|*[!0-9]*|???????*) return 1 ;; esac
-	case "$sum" in *[!0-9a-f]*) return 1 ;; esac
+	# A leading zero is not canonical. The sets are spelled out because
+	# bracket ranges follow the caller's locale collation.
+	case "$len" in ''|*[!0123456789]*|0?*|???????*) return 1 ;; esac
+	case "$sum" in *[!0123456789abcdef]*) return 1 ;; esac
 	[ "${#sum}" -eq 64 ] || return 1
 	[ "$len" -ge 2 ] && [ "$len" -le $((SM_SECRETS_SIZE - SM_SECRETS_HDR_MAX)) ] || return 1
 	printf '%s\n' "$len"
@@ -88,7 +93,7 @@ _sm_secrets_verified() {
 	local dev="$1" hdr len n got
 	hdr="$(_sm_secrets_header "$dev")"
 	len="$(_sm_secrets_len "$hdr")" || return 1
-	n="$(_sm_secrets_payload "$dev" "${#hdr}" "$len" | wc -c | tr -d ' ')"
+	n="$(_sm_secrets_payload "$dev" "${#hdr}" "$len" | LC_ALL=C wc -c | tr -d ' ')"
 	[ "$n" = "$len" ] || return 1
 	got="$(_sm_secrets_payload "$dev" "${#hdr}" "$len" | sha256sum | cut -d' ' -f1)"
 	[ "$got" = "${hdr##* }" ] || return 1

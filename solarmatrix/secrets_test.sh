@@ -77,14 +77,8 @@ CASES=$((CASES + 1))
 { printf 'SMFS1 99999999999999999999 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n'; } > "$T/p"; pad_secrets "$T/p"
 assert_eq corrupt "$(state "$T/p")" "case 10: overflowing length"
 
-# --- Case 11: sm_secrets_dev finds the partition by label in /proc/mtd ---
+# --- Case 11: sm_secrets_dev honours SOLARMATRIX_SECRETS_DEV ---
 CASES=$((CASES + 1))
-RC=0; OUT=$(sh -c ". '$LIB'; SOLARMATRIX_SECRETS_DEV='' sm_secrets_dev" 2>/dev/null) || RC=$?
-case "$(uname)" in
-    Linux) ;;  # a real /proc/mtd may or may not have it; nothing to assert
-    *) assert_eq '' "$OUT" "case 11: no /proc/mtd on macOS, so nothing is found"
-       assert_eq 1 "$RC" "case 11: not found returns 1" ;;
-esac
 OUT=$(sh -c ". '$LIB'; SOLARMATRIX_SECRETS_DEV=/dev/mtd9 sm_secrets_dev")
 assert_eq /dev/mtd9 "$OUT" "case 11: override honoured"
 
@@ -146,6 +140,27 @@ printf 'mtd4: 000a0000 00010000 "factory"\n' > "$T/mtd"
 RC=0; OUT=$(sh -c ". '$LIB'; SOLARMATRIX_MTD='$T/mtd' sm_secrets_dev") || RC=$?
 assert_eq 1 "$RC" "case 19: image without the split returns 1"
 assert_eq '' "$OUT" "case 19: and prints nothing"
+
+# --- Case 20: the erased check counts bytes, whatever the caller's locale ---
+# 0xC3 0xBF is U+00FF in UTF-8. A locale-aware tr treats it as the one
+# character '\377' and would count this partition as erased.
+CASES=$((CASES + 1))
+printf '\303\277' > "$T/p"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    cat "$T/p" "$T/p" > "$T/p2"; mv "$T/p2" "$T/p"
+done
+assert_eq 131072 "$(wc -c < "$T/p" | tr -d ' ')" "case 20: fixture is partition sized"
+assert_eq corrupt "$(LC_ALL=en_US.UTF-8 sh -c ". '$LIB'; sm_secrets_state '$T/p'")" \
+    "case 20: UTF-8 U+00FF is not an erased byte"
+assert_eq en_US.UTF-8 "$(LC_ALL=en_US.UTF-8 sh -c ". '$LIB'; printf '%s' \"\$LC_ALL\"")" \
+    "case 20: sourcing leaves the caller's locale alone"
+
+# --- Case 21: a length with a leading zero is not canonical ---
+CASES=$((CASES + 1))
+LEN=$(printf '%s' "$JSON" | wc -c | tr -d ' ')
+SUM=$(printf '%s' "$JSON" | shasum -a 256 | cut -d' ' -f1)
+{ printf 'SMFS1 0%s %s\n' "$LEN" "$SUM"; printf '%s' "$JSON"; } > "$T/p"; pad_secrets "$T/p"
+assert_eq corrupt "$(state "$T/p")" "case 21: leading-zero length"
 
 rm -rf "$T"
 finish
