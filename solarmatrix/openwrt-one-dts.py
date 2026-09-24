@@ -102,10 +102,31 @@ def unit_address(name):
         return None
 
 
+def compatible(node):
+    return str(node["props"].get("compatible", "")).strip()
+
+
+def layout_children(node):
+    """The children of node that are partitions of NOR_LAYOUT."""
+    layout = set(NOR_LAYOUT)
+    found = []
+    for name, sub in node["children"]:
+        reg = reg_of(sub)
+        label = str(sub["props"].get("label", "")).strip('"')
+        if reg and (label, reg[0], reg[1]) in layout:
+            found.append(label)
+    return found
+
+
 def table_problems(table):
     """Checks a fixed-partitions node. Every child is a partition."""
     problems, parts = [], []
     layout = set(NOR_LAYOUT)
+    # Another parser (a different compatible) would read the children its own
+    # way, so none of the checks below would say anything about the result.
+    if compatible(table) != '"fixed-partitions"':
+        problems.append('NOR partitions node is %s, expected "fixed-partitions"'
+                        % (compatible(table) or "without a compatible"))
     for name, node in table["children"]:
         label = str(node["props"].get("label", "")).strip('"')
         reg = reg_of(node)
@@ -146,7 +167,10 @@ def table_problems(table):
         if "read-only" not in factory[3]["props"]:
             problems.append("factory is not read-only; its MACs and WiFi "
                             "calibration would be writable")
-        cells = child(factory[3], "nvmem-layout") or {"children": []}
+        cells = child(factory[3], "nvmem-layout") or {"props": {}, "children": []}
+        if compatible(cells) != '"fixed-layout"':
+            problems.append('factory nvmem-layout is %s, expected "fixed-layout"'
+                            % (compatible(cells) or "missing or without a compatible"))
         for cell_name in FACTORY_CELLS:
             cell = child(cells, cell_name)
             reg = cell and reg_of(cell)
@@ -200,6 +224,37 @@ def walk(node, path="/"):
         yield from walk(sub, path.rstrip("/") + "/" + name)
 
 
+# The NOR sits on the SoC's spi2 controller, spi@1100b000 (mt7981.dtsi).
+SPI2_UNIT = "spi@1100b000"
+
+
+def available(node):
+    # As of_device_is_available(): no status, "okay" or "ok".
+    return str(node["props"].get("status", '"okay"')).strip() in ('"okay"', '"ok"')
+
+
+def find_spi2(tree):
+    """Returns (path, node) of the spi2 controller, or (problem, None).
+
+    By path, not by the flash's compatible: a flash bound by part name needs
+    no jedec,spi-nor, and a decoy elsewhere could carry one.
+    """
+    nodes = dict(walk(tree))
+    symbols = child(tree, "__symbols__")
+    target = symbols and symbols["props"].get("spi2")
+    if target:
+        path = str(target).strip('"')
+        if path not in nodes:
+            return "__symbols__/spi2 points to %s, which is not in the tree" % path, None
+        return path, nodes[path]
+    found = [(p, n) for p, n in nodes.items() if p.rsplit("/", 1)[-1] == SPI2_UNIT]
+    if not found:
+        return "no spi2 controller: no __symbols__/spi2 and no %s node" % SPI2_UNIT, None
+    if len(found) > 1:
+        return "%d %s nodes: %s" % (len(found), SPI2_UNIT, ", ".join(p for p, _ in found)), None
+    return found[0]
+
+
 def dtb_problems(dtb):
     """Checks the NOR table in a compiled DTB, as the kernel will see it."""
     try:
@@ -214,15 +269,32 @@ def dtb_problems(dtb):
         tree, _ = parse_node(text, root.end())
     except ValueError as e:
         return ["cannot parse the decompiled %s: %s" % (dtb, e)]
-    flashes = [(p, n) for p, n in walk(tree)
-               if '"jedec,spi-nor"' in str(n["props"].get("compatible", ""))]
-    if len(flashes) != 1:
-        return ["expected one jedec,spi-nor flash, found %d" % len(flashes)]
-    path, flash = flashes[0]
-    table = child(flash, "partitions")
-    if not table:
-        return ["%s has no partitions node" % path]
-    return table_problems(table)
+
+    problems = []
+    spi2_path, spi2 = find_spi2(tree)
+    table = None
+    if spi2 is None:
+        problems.append(spi2_path)
+    else:
+        flash_path = spi2_path.rstrip("/") + "/flash@0"
+        flash = child(spi2, "flash@0")
+        table = flash and child(flash, "partitions")
+        if not available(spi2):
+            problems.append("%s is disabled" % spi2_path)
+        if not flash:
+            problems.append("%s has no flash@0" % spi2_path)
+        elif not available(flash):
+            problems.append("%s is disabled" % flash_path)
+        elif not table:
+            problems.append("%s has no partitions node" % flash_path)
+        else:
+            problems += table_problems(table)
+    # A second copy of the table anywhere else could be the one that binds.
+    for path, node in walk(tree):
+        if node is not table and layout_children(node):
+            problems.append("%s also carries NOR partitions (%s)"
+                            % (path, ", ".join(layout_children(node))))
+    return problems
 
 
 def patch(path, tag):

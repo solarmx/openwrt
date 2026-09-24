@@ -60,11 +60,12 @@ assert_contains 'spidev@0' "$(cat "$T/patched.dts")" "case 1: spidev added"
 
 # --- Case 2: the pinned release's DTS patches cleanly ---
 CASES=$((CASES + 1))
-if git -C "$REPO" show "v25.12.5:$DTS_PATH" > "$T/v25125.dts" 2>/dev/null; then
-    run patch "$T/v25125.dts" vTEST
-    assert_eq 0 "$RC" "case 2: v25.12.5 patch succeeds ($OUT)"
+PINNED="$(sed -n 's/^PINNED_TAG="\(.*\)"$/\1/p' "$HERE/build-firmware.sh")"
+if [ -n "$PINNED" ] && git -C "$REPO" show "$PINNED:$DTS_PATH" > "$T/pinned.dts" 2>/dev/null; then
+    run patch "$T/pinned.dts" vTEST
+    assert_eq 0 "$RC" "case 2: $PINNED patch succeeds ($OUT)"
 else
-    echo "FAIL: case 2: tag v25.12.5 is not in this clone"; FAIL=$((FAIL + 1))
+    echo "FAIL: case 2: PINNED_TAG '$PINNED' is not a tag in this clone"; FAIL=$((FAIL + 1))
 fi
 
 # --- Case 3: the patched output passes the source check ---
@@ -129,15 +130,18 @@ source_fails "case 15" "$T/x.dts" '&macaddr_factory_4 overrides a node of the NO
 
 # --- DTB checks: the patched flash node, compiled on its own by dtc ---
 # wrap_flash IN OUT [EXTRA]: a minimal tree holding IN's &spi2 flash@0 node at
-# the path the real SoC has, followed by EXTRA.
+# the path the real SoC has (the controller labelled spi2), followed by EXTRA.
+# DTC_FLAGS=-@ adds __symbols__, as an overlay-capable build does.
 wrap_flash() {
     {
         printf '/dts-v1/;\n/ {\n\tsoc {\n\t\t#address-cells = <1>;\n\t\t#size-cells = <1>;\n'
-        printf '\t\tspi@1100b000 {\n\t\t\treg = <0x1100b000 0x100>;\n\t\t\t#address-cells = <1>;\n\t\t\t#size-cells = <0>;\n'
+        printf '\t\tspi2: spi@1100b000 {\n\t\t\treg = <0x1100b000 0x100>;\n\t\t\t#address-cells = <1>;\n\t\t\t#size-cells = <0>;\n'
         awk '/^&spi2 \{/{s=1} s && /^\tflash@0 \{/{f=1} f{print} f && /^\t\};/{exit}' "$1"
         printf '\t\t};\n\t};\n};\n%s\n' "${3:-}"
     } > "$T/wrap.dts"
-    dtc -q -I dts -O dtb -o "$2" "$T/wrap.dts"
+    local flags=()
+    [ -z "${DTC_FLAGS:-}" ] || flags=("$DTC_FLAGS")
+    dtc -q ${flags[@]+"${flags[@]}"} -I dts -O dtb -o "$2" "$T/wrap.dts"
 }
 
 dtb_fails() {
@@ -175,10 +179,50 @@ dtb_fails "case 19" "$T/b1.dtb" 'macs@40000 (macs) 0x40000+0x1000 is not in the 
 # --- Case 20: a DTB without a NOR flash ---
 printf '/dts-v1/;\n/ { model = "none"; };\n' > "$T/empty.dts"
 dtc -q -I dts -O dtb -o "$T/empty.dtb" "$T/empty.dts"
-dtb_fails "case 20" "$T/empty.dtb" 'expected one jedec,spi-nor flash, found 0'
+dtb_fails "case 20" "$T/empty.dtb" 'no spi2 controller: no __symbols__/spi2 and no spi@1100b000 node'
 
 # --- Case 21: a missing DTB ---
 dtb_fails "case 21" "$T/missing.dtb" 'cannot decompile'
+
+# --- Case 22: a partitions node that is not fixed-partitions (m_compat) ---
+sed 's/compatible = "fixed-partitions";/compatible = "acme,unknown-partitions";/' "$T/patched.dts" > "$T/x.dts"
+source_fails "case 22" "$T/x.dts" 'partitions node is "acme,unknown-partitions", expected "fixed-partitions"'
+CASES=$((CASES + 1))
+wrap_flash "$T/x.dts" "$T/compat.dtb"
+run check-dtb "$T/compat.dtb"
+assert_nonzero "$RC" "case 22: DTB refused"
+assert_contains 'expected "fixed-partitions"' "$OUT" "case 22: DTB names the problem"
+
+# --- Case 23: factory's nvmem-layout that is not fixed-layout ---
+sed 's/compatible = "fixed-layout";/compatible = "acme,layout";/' "$T/patched.dts" > "$T/x.dts"
+source_fails "case 23" "$T/x.dts" 'factory nvmem-layout is "acme,layout", expected "fixed-layout"'
+
+# --- Case 24: a decoy jedec,spi-nor carries the table, the real flash is renamed (m_second) ---
+awk '/^&spi2 \{/{s=1} s && /^\tflash@0 \{/{f=1} f{print} f && /^\t\};/{exit}' "$T/patched.dts" |
+    sed 's/[A-Za-z_0-9]*: //; s/reg = <0>;/status = "disabled";/' > "$T/decoy.txt"
+sed '/^&spi2 {/,/^};/s/compatible = "jedec,spi-nor";/compatible = "winbond,w25q512jv";/' "$T/patched.dts" > "$T/x.dts"
+wrap_flash "$T/x.dts" "$T/decoy.dtb" "/ { decoy { $(cat "$T/decoy.txt") }; };"
+dtb_fails "case 24" "$T/decoy.dtb" '/decoy/flash@0/partitions also carries NOR partitions'
+
+# --- Case 25: the NOR flash disabled ---
+wrap_flash "$T/patched.dts" "$T/disabled.dtb" '&{/soc/spi@1100b000/flash@0} { status = "disabled"; };'
+dtb_fails "case 25" "$T/disabled.dtb" '/soc/spi@1100b000/flash@0 is disabled'
+
+# --- Case 26: the controller found through __symbols__ ---
+CASES=$((CASES + 1))
+DTC_FLAGS=-@ wrap_flash "$T/patched.dts" "$T/symbols.dtb"
+run check-dtb "$T/symbols.dtb"
+assert_eq 0 "$RC" "case 26: __symbols__/spi2 is followed ($OUT)"
+
+# --- Case 27: __symbols__/spi2 wins over the unit address ---
+sed 's/^\t\tspi2: spi@1100b000 {/\t\tspi@1100b000 {/' "$T/wrap.dts" > "$T/x.dts" # keep the tree, move the label
+printf '/ { soc { spi2: spi@1100a000 { reg = <0x1100a000 0x100>; #address-cells = <1>; #size-cells = <0>; }; }; };\n' >> "$T/x.dts"
+dtc -q -@ -I dts -O dtb -o "$T/moved.dtb" "$T/x.dts"
+dtb_fails "case 27" "$T/moved.dtb" '/soc/spi@1100a000 has no flash@0'
+
+# --- Case 28: the controller itself disabled ---
+wrap_flash "$T/patched.dts" "$T/spi-off.dtb" '&{/soc/spi@1100b000} { status = "disabled"; };'
+dtb_fails "case 28" "$T/spi-off.dtb" '/soc/spi@1100b000 is disabled'
 
 rm -rf "$T"
 finish
