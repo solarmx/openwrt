@@ -6,7 +6,7 @@ START=20
 STOP=90
 
 NVME_PART=/dev/nvme0n1p1
-MOUNT_POINT=/solarmatrix
+MOUNT_POINT="${SOLARMATRIX_MOUNT_POINT:-/solarmatrix}"
 
 start() {
 	[ -b "$NVME_PART" ] || return 0

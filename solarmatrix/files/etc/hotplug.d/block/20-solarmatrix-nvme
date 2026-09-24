@@ -5,9 +5,10 @@
 
 [ "$DEVICENAME" = nvme0n1p1 ] || exit 0
 . "${SOLARMATRIX_LIB:-/lib/solarmatrix}/storage.sh"
+MOUNT_POINT="${SOLARMATRIX_MOUNT_POINT:-/solarmatrix}"
 
 case "$ACTION" in
-add)    sm_storage_mount "/dev/$DEVICENAME" /solarmatrix ;;
-remove) sm_storage_umount /solarmatrix ;;
+add)    sm_storage_mount "/dev/$DEVICENAME" "$MOUNT_POINT" ;;
+remove) sm_storage_umount "$MOUNT_POINT" ;;
 esac
 exit 0
