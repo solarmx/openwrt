@@ -84,7 +84,8 @@ The posture, applied before dropbear (`START=19`) binds a socket:
 | NOR | `corrupt`, or `valid` with no keys or JSON that does not parse | key-only on `lan`, `authorized_keys` empty, logged at `daemon.crit` |
 
 On NOR, dropbear is enabled only after the key-only settings have verifiably
-taken; otherwise it stays disabled.
+taken; otherwise it stays disabled. An unprovisioned unit whose image lacks
+`provisioning.pub` gets an empty `authorized_keys`, logged at `daemon.crit`.
 
 The script tells NOR from NAND by the last `/` entry in `/proc/mounts`: `rootfs`
 or `tmpfs` means an initramfs, anything else counts as NAND, so a wrong guess
