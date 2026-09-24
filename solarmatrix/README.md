@@ -54,11 +54,14 @@ The script:
      sits before `fip-nor` and holds the per-device secrets the provisioning
      tool writes.
 
-   The NOR partition table under `&spi2 flash@0` is then checked as a whole.
-   The `partitions` node must be `compatible = "fixed-partitions"` and
-   factory's `nvmem-layout` `"fixed-layout"`, since another parser would read
-   the children its own way. Every child of the `partitions` node counts, whatever it is called, since
-   the kernel makes an MTD partition of any child with a `reg`. The table
+   The NOR partition table is then checked as a whole. The NOR is the one
+   enabled child of `&spi2` at chip select 0 (`reg = <0>`), whatever it is
+   called; no other child of `&spi2` may have a `partitions` node. The
+   `partitions` node must be `compatible = "fixed-partitions"` and factory's
+   `nvmem-layout` `"fixed-layout"`, since another parser would read the
+   children its own way. Every child of the `partitions` node counts,
+   whatever it is called, since the kernel makes an MTD partition of any
+   child with a `reg`. The table
    must be exactly `bl2-nor` `0x0+0x40000`, `factory` `0x40000+0xa0000`,
    `factory-secrets` `0xe0000+0x20000`, `fip-nor` `0x100000+0x80000` and
    `recovery` `0x180000+0xc80000`: contiguous, with no gap, overlap,
@@ -101,10 +104,16 @@ The script:
    table of the one compiled `image-mt7981b-openwrt-one.dtb`, decompiled with
    `dtc`, passing the same rules as in step 5. In the DTB the NOR is found
    by path, not by its `compatible` (a flash bound by part name needs no
-   `jedec,spi-nor`): the controller `__symbols__/spi2` points to, or else the
-   one `spi@1100b000` node. That controller and its `flash@0` must not be
-   disabled, and no other node anywhere may carry a partition of the NOR
-   layout.
+   `jedec,spi-nor`) and not through `__symbols__` (which the source can
+   write). The controller is spi2 = `spi@11009000` (`mt7981b.dtsi` as
+   completed by `patches-6.12/117-complete-mt7981b-dtsi.patch`; spi0 =
+   `spi@1100a000` carries the NAND, spi1 = `spi@1100b000` the mikroBUS
+   spidev): there must be exactly one `spi@11009000` node in the tree, at
+   `/soc/spi@11009000`, with `reg` starting at `0x11009000`, and if
+   `__symbols__/spi2` exists it must name that path. The controller and its
+   CS0 flash must be enabled. The only partition tables allowed anywhere
+   (any `fixed-partitions` node or any node named `partitions`) are that
+   flash's and the NAND's on spi0's CS0 flash.
 10. Empties `solarmatrix/out/` and generates
     `solarmatrix/out/openwrt-licenses.json` listing every installed package's
     OSS license (per the build manifest).

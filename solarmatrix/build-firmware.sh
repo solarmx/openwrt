@@ -8,8 +8,9 @@
 #
 # "latest" is resolved once, up front, and everything downstream sees the
 # concrete tag it resolved to: the checkout, CONFIG_VERSION_NUMBER, the image
-# names, tag.txt and the license manifest. A build is therefore still reproducible after the
-# fact, because the artifacts record which tag was actually built.
+# names, tag.txt and the license manifest. A build is therefore still
+# reproducible after the fact, because the artifacts record which tag was
+# actually built.
 #
 # This script is part of the GPL-2.0 OpenWRT fork. It contains no proprietary
 # SolarMatrix code and never reads from the controller repository.
