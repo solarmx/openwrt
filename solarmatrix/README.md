@@ -35,17 +35,18 @@ The script:
 1. Resolves the tag argument, and refuses anything that is not a real
    `refs/tags/` entry so a branch name or commit SHA cannot masquerade as
    a release.
-2. Checks out that tag in detached mode.
-3. Overlays `solarmatrix/` back onto the tag's tree so these build scripts
-   remain available.
-4. Stages `solarmatrix/files/` as the top-level `files/` rootfs overlay, which
-   OpenWRT copies verbatim into the image (see [Device hardening](#device-hardening)).
-5. Patches the OpenWRT One DTS (`mt7981b-openwrt-one.dts`) with
-   `openwrt-one-dts.py`. The file is restored from the tag first, so a rerun
-   never patches it twice; the result is written only if every check passes,
-   otherwise the build fails naming each problem and the DTS is left
-   untouched; and the exit trap restores it from the tag again, on success
-   and on failure, so the next run's tag checkout is not blocked. The edits:
+2. Checks out that tag in detached mode, then overlays `solarmatrix/` from
+   the invoking branch so these build scripts remain available. It refuses
+   to run from a detached HEAD.
+3. Stages `solarmatrix/files/` as the top-level `files/` rootfs overlay, which
+   OpenWRT copies verbatim into the image (see [Device hardening](#device-hardening)),
+   and `solarmatrix/patches/uboot-mediatek/*.patch` into U-Boot's patch
+   directory. Copies of overlay files that a previous build left in
+   `build_dir` are deleted, so only this build's overlay can pass the
+   rootfs check.
+4. Updates and installs the package feeds.
+5. Patches the OpenWRT One DTS (`target/linux/mediatek/dts/mt7981b-openwrt-one.dts`)
+   with `openwrt-one-dts.py patch`:
    - expose the mikroBUS SPI bus as `/dev/spidev2.0` for the MCP2515 CAN
      module (UART2 disabled, `mikrobus-reset` gpio-export dropped);
    - split the NOR `factory` partition. `factory` shrinks to
@@ -54,87 +55,149 @@ The script:
      sits before `fip-nor` and holds the per-device secrets the provisioning
      tool writes.
 
-   The NOR partition table is then checked as a whole. The NOR is the one
-   enabled child of `&spi2` at chip select 0 (`reg = <0>`), whatever it is
-   called; no other child of `&spi2` may have a `partitions` node. The
-   `partitions` node must be `compatible = "fixed-partitions"` and factory's
-   `nvmem-layout` `"fixed-layout"`, since another parser would read the
-   children its own way. Every child of the `partitions` node counts,
-   whatever it is called, since the kernel makes an MTD partition of any
-   child with a `reg`. The table
-   must be exactly `bl2-nor` `0x0+0x40000`, `factory` `0x40000+0xa0000`,
-   `factory-secrets` `0xe0000+0x20000`, `fip-nor` `0x100000+0x80000` and
-   `recovery` `0x180000+0xc80000`: contiguous, with no gap, overlap,
-   duplicate or unknown child, and no child without a `reg`. `factory` must
-   be read-only with its `eeprom@0`, `macaddr@4` and `macaddr@24` nvmem cells
-   inside it; `factory-secrets` must not be read-only. In the source,
-   `/delete-property/` or `/delete-node/` inside `&spi2`, any `&{/path}`
-   reference, and any override of a label defined in `&spi2` are refused
-   too. The same table rules run again on the compiled DTB after the build
-   (step 9).
+   The file is restored from the tag first, so a rerun never patches it
+   twice. The result is written only if every edit applied and the source
+   NOR check passes (see [Build gates](#build-gates)). Otherwise the build
+   fails, names each problem and leaves the DTS untouched.
 6. Writes a hardcoded `.config` for **OpenWRT One** (MediaTek MT7981B,
    filogic subtarget, device `openwrt_one`), with `cryptsetup`, `kmod-dm` and
    `kmod-crypto-xts` for the LUKS2 NVMe, `odhcpd` deselected (the LAN is IPv4
-   only), and failsafe compiled out (`CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE`).
-   After `make defconfig` it fails the build if any requested package, the
-   release version or the failsafe option was dropped, if `odhcpd` is still
-   selected, if `CONFIG_TARGET_PER_DEVICE_ROOTFS` is set (the device profile,
-   not this `.config`, would decide the image contents), or if `kmod-mtd-rw`
-   (which makes every MTD partition writable) is selected.
+   only), and failsafe compiled out (`CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE`),
+   then runs `make defconfig`.
 7. Runs `make -j<nproc>` to produce firmware.
-8. Verifies every file under `solarmatrix/files/` reached the rootfs **byte
-   for byte**: the boot, hotplug, init and `solarmatrix-storage` scripts must
-   also be executable; the sourced libraries, `provisioning.pub`,
-   `security-model`, `inittab`, `config/dropbear` and the two no-op
-   uci-defaults (`50-dropbear`, `50-root-passwd`) are compared only; for the
-   files a package also ships, this proves the overlay replaced the package's
-   copy. Any entry under `solarmatrix/files/` (symlinks included) that neither
-   list in `build-gates.sh` covers fails the build before `make`. Stale copies
-   from a previous build are deleted before `make`, so only a real overlay
-   application can satisfy the check. There must be exactly one rootfs
-   staging directory (`build_dir/target-*/root-mediatek*`).
-9. Verifies U-Boot has no unsigned recovery paths (see the 900 patch), then
-   checks the staged rootfs and images: failsafe disabled in
-   `lib/preinit/00_preinit.conf`, no `login.sh` in `etc/inittab`, no
-   `usr/sbin/odhcpd` (not even a symlink), no obsolete
-   `sbin/solarmatrix-harden-ssh`, `etc/config/dropbear` shipped with
-   `enable '0'`; this release's
-   `openwrt-<version>-mediatek-filogic-openwrt_one-initramfs.itb` present and
-   no larger than the 13,107,200-byte NOR `recovery` partition; and the NOR
-   table of the one compiled `image-mt7981b-openwrt-one.dtb`, decompiled with
-   `dtc`, passing the same rules as in step 5. In the DTB the NOR is found
-   by path, not by its `compatible` (a flash bound by part name needs no
-   `jedec,spi-nor`) and not through `__symbols__` (which the source can
-   write). The controller is spi2 = `spi@11009000` (`mt7981b.dtsi` as
-   completed by `patches-6.12/117-complete-mt7981b-dtsi.patch`; spi0 =
-   `spi@1100a000` carries the NAND, spi1 = `spi@1100b000` the mikroBUS
-   spidev): there must be exactly one `spi@11009000` node in the tree, at
-   `/soc/spi@11009000`, with `reg` starting at `0x11009000`, and if
-   `__symbols__/spi2` exists it must name that path. The controller must
-   have exactly one CS0 child, whatever its status, and it and the
-   controller must be enabled (by the first string of `status`, as the
-   kernel reads it); no other child of the controller may have any child
-   node. The only partition tables allowed anywhere (any `fixed-partitions`
-   node or any node named `partitions`) are that flash's and the NAND's on
-   spi0's CS0 flash, and no flash on any SPI controller may have direct
-   children with a `reg` and no `compatible`, which ofpart would read as a
-   legacy partition table.
-10. Empties `solarmatrix/out/` and generates
-    `solarmatrix/out/openwrt-licenses.json` listing every installed package's
-    OSS license (per the build manifest).
-11. Copies this release's firmware images (`openwrt-<version>-mediatek-filogic-*`)
-    and `profiles.json` to `solarmatrix/out/`, failing on any copy that does
-    not succeed, and writes `solarmatrix/out/sha256sums` over exactly the
-    staged images, so `sha256sum -c sha256sums` passes in `out/`. Images of
-    older releases left in `bin/targets` are not staged, and OpenWrt's own
-    `sha256sums` (which covers the whole target directory, packages
-    included) is not copied.
+8. Runs the post-build gates on the staged rootfs, U-Boot, the images and the
+   compiled DTB (see [Build gates](#build-gates)).
+9. Empties `solarmatrix/out/`, writes `openwrt-licenses.json` listing every
+   installed package's OSS license (per the build manifest), stages this
+   release's images and `profiles.json`, and writes `sha256sums` and
+   `tag.txt` (see [Outputs](#outputs)).
 
-Both `version` and `files/` are generated at build time and removed again by
-the script's exit trap; it refuses to start if either already exists.
+The script refuses to start if a top-level `version` or `files` already
+exists, so its exit trap never deletes anything it did not create. The trap
+runs on success and on failure. It removes `files/` and the staged U-Boot
+patches, and it restores the DTS from the tag so the next run's tag checkout
+is not blocked. Ctrl-C or `TERM` stops the build, and the trap still runs.
 
 Hardware target is fixed to OpenWRT One; adding other targets would
 require changing the hardcoded `.config` in `build-firmware.sh`.
+
+## Build gates
+
+Each gate stops the build with an `ERROR:` line that names what is wrong. The
+shell gates are in `build-gates.sh`, the DTS checks in `openwrt-one-dts.py`
+and the U-Boot check in `build-firmware.sh`. In build order:
+
+- **Overlay list** (before `make`): refuses any entry under
+  `solarmatrix/files/`, symlinks included, that is not in
+  `build-gates.sh`'s `OVERLAY_EXECUTABLES` or `OVERLAY_DATA`, so no file
+  ships without the rootfs check.
+- **DTS source** (before `make`): refuses a patch edit that did not apply
+  (the upstream DTS changed shape) and a NOR table that breaks the
+  [NOR table rules](#nor-table-rules). It also refuses `/delete-property/`
+  or `/delete-node/` inside `&spi2`, any `&{/path}` reference, and any
+  `&label { ... }` override of a label defined in `&spi2`.
+- **defconfig** (after `make defconfig`): refuses a dropped required package
+  (the `REQUIRED_PACKAGES` in `build-gates.sh`) or a dropped
+  `CONFIG_VERSION_NUMBER` (the image would be built as SNAPSHOT). It also
+  refuses a dropped `CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE`, any selected
+  `odhcpd` package and `CONFIG_TARGET_PER_DEVICE_ROOTFS` (the device
+  profile, not this `.config`, would decide the image contents). Finally it
+  refuses `kmod-mtd-rw` as `y` or `m`, since that makes every MTD partition
+  writable, `factory` included.
+- **Release version**: refuses a build that has anything other than exactly
+  one rootfs staging directory (`build_dir/target-*/root-mediatek*`). It
+  also refuses an `etc/openwrt_release` there without
+  `DISTRIB_RELEASE='<version>'`.
+- **Overlay in rootfs**: refuses any listed file that differs from
+  `solarmatrix/files/` by even a byte, and any listed executable (the boot,
+  hotplug, init and `solarmatrix-storage` scripts) that has lost its x bit.
+  Some files are also shipped by a package: `inittab`, `config/dropbear`
+  and the no-op `50-dropbear` and `50-root-passwd`. For those, the match
+  proves that the overlay replaced the package's copy.
+- **U-Boot**: refuses a missing NOR or SNAND `u-boot.bin`, one that still
+  runs the button recovery checks (`bootcmd=run check_button`), and one
+  that lacks the boot commands the 900 patch sets.
+- **Rootfs**: refuses these:
+  - failsafe not disabled in `lib/preinit/00_preinit.conf`;
+  - `login.sh` in `etc/inittab`;
+  - `usr/sbin/odhcpd` or the obsolete `sbin/solarmatrix-harden-ssh`, even
+    as a dangling symlink;
+  - an `etc/config/dropbear` without `option enable '0'`.
+- **Initramfs**: refuses a missing
+  `openwrt-<version>-mediatek-filogic-openwrt_one-initramfs.itb`, and one
+  larger than the 13,107,200-byte NOR `recovery` partition. The image is
+  found by this release's exact name, so an older image left in
+  `bin/targets` never counts.
+- **Compiled DTB**: refuses anything other than exactly one
+  `image-mt7981b-openwrt-one.dtb` under `build_dir`. It then decompiles the
+  DTB with `dtc` and refuses a table that breaks the
+  [NOR table rules](#nor-table-rules) or the [DTB rules](#dtb-rules).
+- **Staging**: refuses a build with no images for this version, a missing
+  `profiles.json`, a copy that fails, or a `sha256sums` that cannot be
+  written.
+
+### NOR table rules
+
+These rules are checked in the source and again in the compiled DTB. The NOR
+is the controller's one child at chip select 0 (`reg = <0>`), whatever that
+child is called. There must be exactly one such child whatever its status,
+and both it and the controller must be enabled. No other child of the
+controller may have child nodes. The flash's `partitions` node must be
+`compatible = "fixed-partitions"` and factory's `nvmem-layout` must be
+`"fixed-layout"`, because another parser would read the children its own
+way. Every child of `partitions` counts, whatever it is called, because the
+kernel makes an MTD partition of any child with a `reg`. The table must be
+exactly:
+
+| Partition | Offset | Size |
+|---|---|---|
+| `bl2-nor` | `0x0` | `0x40000` |
+| `factory` | `0x40000` | `0xa0000` |
+| `factory-secrets` | `0xe0000` | `0x20000` |
+| `fip-nor` | `0x100000` | `0x80000` |
+| `recovery` | `0x180000` | `0xc80000` |
+
+The table must be contiguous, with no gap, overlap, duplicate or unknown
+child. It must have no child without a parsable `reg` and no unit address
+that differs from its `reg` offset. `factory` must be read-only, with its
+`eeprom@0`, `macaddr@4` and `macaddr@24` nvmem cells inside it.
+`factory-secrets` must not be read-only.
+
+### DTB rules
+
+In the DTB the NOR controller is found by path. It is not found by
+`compatible`, because a flash bound by part name needs no `jedec,spi-nor`.
+It is not found through `__symbols__` either, because the source can write
+that node. The controller is spi2 = `spi@11009000` (`mt7981b.dtsi` as
+completed by `patches-6.12/117-complete-mt7981b-dtsi.patch`). spi0 =
+`spi@1100a000` carries the NAND and spi1 = `spi@1100b000` the mikroBUS
+spidev. On top of the table rules, the DTB check requires the following:
+
+- exactly one `spi@11009000` node in the tree, at `/soc/spi@11009000`, whose
+  `reg` starts at `0x11009000`;
+- if `__symbols__/spi2` exists, it must name that path;
+- "enabled" means what the kernel's `of_device_is_available()` means: no
+  `status`, or a first `status` string of `okay` or `ok`;
+- the only partition tables allowed anywhere (any `fixed-partitions` node or
+  any node named `partitions`) are the NOR's and the NAND's on spi0's CS0
+  flash;
+- no flash on any SPI controller may have direct children with a `reg` and
+  no `compatible`, because ofpart would read those as a legacy partition
+  table.
+
+`openwrt-one-dts.py check-source DTS` runs the source check on an already
+patched DTS without editing it. The build does not use it.
+
+### Known limitations
+
+- The DTB check models the kernel's partition parsing; it does not run the
+  kernel. It is meant to catch an upstream or accidental change that
+  alters the NOR table. A deliberate edit to our own DTS that exploits a
+  gap left in that model is out of scope, because anyone who can edit the
+  DTS can edit the gate too.
+- The compiled-DTB check is first exercised by a full build.
+  `dts_test.sh` runs it against DTBs that it compiles itself with `dtc`,
+  not against the kernel build's `image-mt7981b-openwrt-one.dtb`.
 
 ## Device hardening
 
