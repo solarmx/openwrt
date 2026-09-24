@@ -27,14 +27,16 @@ SM_LOCK="${SOLARMATRIX_LOCK:-/var/lock/solarmatrix-storage}"
 # held; giving up then fails closed instead of hanging every later mount,
 # shutdown included.
 SM_LOCK_TRIES="${SOLARMATRIX_LOCK_TRIES:-30}"
+case "$SM_LOCK_TRIES" in ''|*[!0123456789]*) SM_LOCK_TRIES=30 ;; esac
 
 sm_storage_log() {
 	logger -t solarmatrix-storage -p "daemon.$1" "$2"
 }
 
-# Prints the source mounted at MOUNT_POINT, or nothing.
+# Prints the source mounted at MOUNT_POINT, or nothing. Stacked mounts are
+# listed bottom first, so the last match is the one that is visible.
 _sm_storage_source() {
-	awk -v mp="$1" '$2 == mp { print $1; exit }' "$SM_MOUNTS" 2>/dev/null
+	awk -v mp="$1" '$2 == mp { s = $1 } END { if (s != "") print s }' "$SM_MOUNTS" 2>/dev/null
 }
 
 _sm_storage_mounted() {
@@ -95,12 +97,20 @@ _sm_storage_mount() {
 
 	src="$(_sm_storage_source "$mp")"
 	if [ -n "$src" ]; then
-		# A provisioned unit trusts only its own encrypted volume there.
-		if [ "$state" = valid ] && [ "$src" != "$mapper" ]; then
+		# A provisioned unit trusts only its own encrypted volume there, and
+		# corrupt secrets can never have opened it legitimately.
+		case "$state" in
+		empty) return 0 ;;
+		valid)
+			[ "$src" = "$mapper" ] && return 0
 			sm_storage_log crit "$mp is already mounted from $src, not $mapper"
 			return 1
-		fi
-		return 0
+			;;
+		*)
+			sm_storage_log crit "factory-secrets is corrupt or missing; $mp is already mounted from $src"
+			return 1
+			;;
+		esac
 	fi
 
 	type="$(blkid -s TYPE -o value "$device" 2>/dev/null)"

@@ -354,4 +354,34 @@ assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 31: logged at crit"
 assert_eq '' "$(cat "$T/mount.log")" "case 31: nothing mounted"
 rm -rf "$T"
 
+# --- Case 32: corrupt secrets refuse a mount point that is already mounted ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$JSON"
+printf 'X' | dd of="$T/secrets" bs=1 seek=100 conv=notrunc 2>/dev/null
+printf '/dev/nvme0n1p1 %s ext4 rw 0 0\n' "$T/mnt" > "$T/mounts"
+RC=0; run_mount "$T" env BLKID_TYPE=ext4 >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 32: refused"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 32: logged at crit"
+assert_eq '' "$(cat "$T/mount.log")" "case 32: nothing mounted"
+rm -rf "$T"
+
+# --- Case 33: the top of a stacked mount is what counts ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"; make_secrets "$T/secrets" "$JSON"
+printf '%s %s ext4 rw 0 0\n/dev/sda1 %s ext4 rw 0 0\n' "$T/mapper/solarmatrix" "$T/mnt" "$T/mnt" > "$T/mounts"
+RC=0; run_mount "$T" env BLKID_TYPE=crypto_LUKS >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 33: refused"
+assert_contains "from /dev/sda1" "$(cat "$T/logger.log")" "case 33: names the top mount"
+assert_eq '' "$(cat "$T/mount.log")" "case 33: nothing mounted"
+rm -rf "$T"
+
+# --- Case 34: a non-numeric lock try count falls back to 30 instead of spinning ---
+CASES=$((CASES + 1)); T=$(mktemp -d); make_sandbox "$T"
+# perl's alarm stops the run if the retry loop never gives up.
+RC=0; in_sandbox "$T" perl -e 'alarm 20; exec @ARGV' env BLKID_TYPE=ext4 LOCK_FAIL=1 SOLARMATRIX_LOCK_TRIES=abc \
+    sh -c ". '$LIBDIR/storage.sh'; sm_storage_mount /dev/nvme0n1p1 '$T/mnt'" >/dev/null 2>&1 || RC=$?
+assert_nonzero "$RC" "case 34: refused"
+assert_eq 30 "$(grep -c '^-n ' "$T/lock.log")" "case 34: gave up after 30 tries"
+assert_contains 'daemon.crit' "$(cat "$T/logger.log")" "case 34: logged at crit"
+assert_eq '' "$(cat "$T/mount.log")" "case 34: nothing mounted"
+rm -rf "$T"
+
 finish
