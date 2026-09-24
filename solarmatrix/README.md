@@ -126,6 +126,35 @@ reads `/etc/config/dropbear`. The full runbook lives in
 [`docs/RECOVERY.md`](https://github.com/solar-matrix/provisioning/blob/main/docs/RECOVERY.md)
 in the provisioning repository.
 
+## Factory secrets
+
+`lib/solarmatrix/secrets.sh` (installed as `/lib/solarmatrix/secrets.sh`) is a
+sourced shell library that reads the `factory-secrets` NOR partition added by
+the DTS patch. The provisioning tool writes it once per unit in this format:
+
+```
+SMFS1 <len> <sha256-hex>\n     ASCII header, at most 128 bytes
+<len bytes of JSON>            payload
+0xFF ...                       erased remainder of the 128 KiB
+```
+
+| Function | Result |
+|---|---|
+| `sm_secrets_dev` | Prints the partition's `/dev/mtdN`, found by label in `/proc/mtd`; fails if there is none. |
+| `sm_secrets_state DEV` | Prints `empty`, `valid` or `corrupt`. |
+| `sm_secrets_json DEV` | Prints the JSON payload of a `valid` image and fails for any other state. Its output is secret; do not log it. |
+
+- **empty**: all 131072 bytes read back and every one is `0xFF` — an
+  unprovisioned unit. A short read or a partly erased partition is not empty.
+- **valid**: the header is exactly `SMFS1 <len> <sha256>`, all `<len>` payload
+  bytes read back, and their SHA-256 matches.
+- **corrupt**: anything else, including a missing or unreadable partition.
+  Callers must fail closed on it; a write cut short must never look
+  unprovisioned.
+
+For tests, `SOLARMATRIX_SECRETS_DEV` overrides the device `sm_secrets_dev`
+returns and `SOLARMATRIX_MTD` replaces `/proc/mtd`.
+
 ## Tests
 
 The scripts in this directory are covered by shell test suites, run directly:
@@ -133,10 +162,14 @@ The scripts in this directory are covered by shell test suites, run directly:
 ```sh
 ./solarmatrix/collect-licenses_test.sh
 ./solarmatrix/hardening_test.sh
+bash solarmatrix/secrets_test.sh
 ```
 
 `hardening_test.sh` runs the hardening scripts against a fake `uci` and `service`
 on `PATH` and asserts on the resulting UCI state, so it needs no device.
+`secrets_test.sh` builds partition images in a temp directory and checks
+`secrets.sh` classifies each one correctly, so it needs no device either.
+Shared assertions and image builders live in `testlib.sh`.
 
 ## Outputs
 
