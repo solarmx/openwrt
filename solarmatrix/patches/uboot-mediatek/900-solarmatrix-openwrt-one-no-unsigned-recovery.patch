@@ -1,0 +1,48 @@
+Subject: [PATCH] openwrt-one: no unsigned button or TFTP recovery paths
+
+Stock OpenWrt One U-Boot flashes or boots unsigned images from a button
+press at power-on:
+
+- NOR U-Boot, front button: writes BL2 and the whole NAND from a USB stick.
+- NAND U-Boot, front button: recovery boot, then TFTP boot of anything.
+- NAND U-Boot, back button: writes a sysupgrade image from a USB stick.
+- NAND U-Boot, both systems failing to boot: TFTP recovery forever.
+
+SolarMatrix installs firmware only through its signature-checking helper
+(OTA and USB stick, in Linux). Remove the button checks from bootcmd and
+end boot_default in the error LED loop instead of TFTP.
+
+The serial boot menu is left as it is: it needs the front serial port,
+where the BootROM's UART download is open anyway.
+
+--- a/defenvs/openwrt-one-nor_env
++++ b/defenvs/openwrt-one-nor_env
+@@ -1,7 +1,7 @@
+ ethaddr_factory=mtd read factory 0x46000000 0x0 0x20000 && env readmem -b ethaddr 0x4600002a 0x6 ; setenv ethaddr_factory
+ bl2_mtd_write=mtd erase bl2-nor &&  mtd write bl2-nor $loadaddr 0x0 0x40000
+ bl2_tftp_write=tftpboot $loadaddr $bootfile_bl2_nor && run bl2_mtd_write
+-bootcmd=run check_button ; run led_start ; mtd read recovery ${loadaddr} ; bootm ; run led_loop_error
++bootcmd=run led_start ; mtd read recovery ${loadaddr} ; bootm ; run led_loop_error
+ bootconf=config-1
+ bootdelay=0
+ bootfile=openwrt-mediatek-filogic-openwrt_one-initramfs.itb
+--- a/defenvs/openwrt-one-spi-nand_env
++++ b/defenvs/openwrt-one-spi-nand_env
+@@ -3,7 +3,7 @@
+ serverip=192.168.11.23
+ loadaddr=0x46000000
+ console=earlycon=uart8250,mmio32,0x11002000 console=ttyS0
+-bootcmd=run check_buttons ; run led_start ; run boot_calibration ; run boot_production ; run boot_recovery
++bootcmd=run led_start ; run boot_calibration ; run boot_production ; run boot_recovery
+ bootconf=config-1
+ bootdelay=0
+ bootfile=openwrt-mediatek-filogic-openwrt_one-initramfs.itb
+@@ -25,7 +25,7 @@
+ bootmenu_7=[31mLoad BL2 preloader via TFTP then write to NAND.[0m=run boot_tftp_write_bl2 ; run bootmenu_confirm_return
+ bootmenu_8=Reboot.=reset
+ bootmenu_9=Reset all settings to factory defaults.=run reset_factory ; reset
+-boot_default=run bootcmd ; run boot_recovery ; replacevol=1 ; run boot_tftp_forever
++boot_default=run bootcmd ; run boot_recovery ; run led_loop_error
+ boot_calibration=ubi read $loadaddr calibration && bootm $loadaddr#$bootconf
+ boot_production=led white on ; run ubi_read_production && bootm $loadaddr#$bootconf ; led white off
+ boot_recovery=led green on ; run ubi_read_recovery && bootm $loadaddr#$bootconf ; led green off

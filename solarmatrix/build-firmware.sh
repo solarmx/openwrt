@@ -84,7 +84,7 @@ done
 
 # Cleanup the top-level 'version' override and 'files' overlay so they don't
 # pollute future builds run outside this script.
-trap 'rm -rf "$REPO_ROOT/version" "$REPO_ROOT/files"' EXIT INT TERM
+trap 'rm -rf "$REPO_ROOT/version" "$REPO_ROOT/files" "$REPO_ROOT"/package/boot/uboot-mediatek/patches/9*-solarmatrix-*.patch' EXIT INT TERM
 
 step "Target OpenWRT tag: $TAG"
 
@@ -115,6 +115,15 @@ git checkout "$INVOKING_BRANCH" -- solarmatrix/
 # stage them on every build.
 step "Staging solarmatrix/files as the rootfs overlay"
 cp -a "$REPO_ROOT/solarmatrix/files" "$REPO_ROOT/files"
+
+# Package patches live under solarmatrix/ for the same reason: the tag checkout
+# above restores only solarmatrix/ from our branch, so a patch committed under
+# package/ would silently never reach the build. OpenWRT hashes the patch
+# directory into the package's prepared stamp, so adding or removing one forces
+# U-Boot to be re-extracted and rebuilt.
+step "Staging SolarMatrix U-Boot patches"
+cp "$REPO_ROOT"/solarmatrix/patches/uboot-mediatek/*.patch \
+    "$REPO_ROOT/package/boot/uboot-mediatek/patches/"
 
 # build_dir is not cleaned between builds, so a previous build's copy of these
 # files would satisfy the post-build check even if this build never applied the
@@ -356,6 +365,35 @@ for OVERLAY_FILE in \
     echo "Verified: $ROOTFS_DIR/$OVERLAY_FILE"
 done
 
+# Stock OpenWrt One U-Boot flashes or boots unsigned images from a button press
+# at power-on, and falls back to TFTP when both NAND systems fail. The 900 patch
+# removes those paths; check the built binaries, not the patch, so a patch that
+# stopped applying cannot ship a U-Boot that still has them. u-boot.bin is read
+# from build_dir because the NOR .fip is compressed and shows no env text.
+step "Verifying U-Boot has no unsigned recovery paths"
+for UBOOT_CHECK in \
+    "nor|bootcmd=run led_start ; mtd read recovery" \
+    "snand|bootcmd=run led_start ; run boot_calibration" \
+    "snand|boot_default=run bootcmd ; run boot_recovery ; run led_loop_error" \
+; do
+    UBOOT_VARIANT="${UBOOT_CHECK%%|*}"
+    UBOOT_EXPECT="${UBOOT_CHECK#*|}"
+    UBOOT_BIN="$(find build_dir -maxdepth 4 -path "*/u-boot-mt7981_openwrt_one-$UBOOT_VARIANT/u-boot-*/u-boot.bin" | head -1)"
+    if [ -z "$UBOOT_BIN" ]; then
+        echo "ERROR: no u-boot.bin for openwrt_one-$UBOOT_VARIANT under build_dir" >&2
+        exit 1
+    fi
+    if grep -a -q 'bootcmd=run check_button' "$UBOOT_BIN"; then
+        echo "ERROR: $UBOOT_BIN still runs the button recovery checks at boot" >&2
+        exit 1
+    fi
+    if ! grep -a -q -F "$UBOOT_EXPECT" "$UBOOT_BIN"; then
+        echo "ERROR: $UBOOT_BIN lacks: $UBOOT_EXPECT" >&2
+        exit 1
+    fi
+    echo "Verified: openwrt_one-$UBOOT_VARIANT: $UBOOT_EXPECT"
+done
+
 step "Collecting OpenWRT licenses"
 mkdir -p "$OUT_DIR"
 OPENWRT_TAG="$TAG" "$REPO_ROOT/solarmatrix/collect-licenses.sh" > "$OUT_DIR/openwrt-licenses.json"
@@ -366,6 +404,7 @@ find bin/targets -type f \
     \( -name 'openwrt-*.itb' \
     -o -name 'openwrt-*.ubi' \
     -o -name 'openwrt-*.bin' \
+    -o -name 'openwrt-*.fip' \
     -o -name 'openwrt-*.img*' \
     -o -name '*.manifest' \
     -o -name 'profiles.json' \
