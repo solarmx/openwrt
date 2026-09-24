@@ -36,15 +36,24 @@ The script:
    remain available.
 4. Stages `solarmatrix/files/` as the top-level `files/` rootfs overlay, which
    OpenWRT copies verbatim into the image (see [Device hardening](#device-hardening)).
-5. Writes a hardcoded `.config` for **OpenWRT One** (MediaTek MT7981B,
+5. Patches the OpenWRT One DTS (`mt7981b-openwrt-one.dts`), and fails the
+   build if any edit did not apply:
+   - exposes the mikroBUS SPI bus as `/dev/spidev2.0` for the MCP2515 CAN
+     module (UART2 disabled, `mikrobus-reset` gpio-export dropped);
+   - splits the NOR `factory` partition. `factory` shrinks to
+     `<0x40000 0xa0000>` and keeps the MACs and WiFi calibration read-only. A
+     new writable `factory-secrets` partition, `<0xe0000 0x20000>` (128 KiB),
+     sits before `fip-nor` and holds the per-device secrets the provisioning
+     tool writes.
+6. Writes a hardcoded `.config` for **OpenWRT One** (MediaTek MT7981B,
    filogic subtarget, device `openwrt_one`).
-6. Runs `make -j<nproc>` to produce firmware.
-7. Verifies both hardening scripts reached the rootfs **byte for byte** and are
+7. Runs `make -j<nproc>` to produce firmware.
+8. Verifies both hardening scripts reached the rootfs **byte for byte** and are
    executable, and fails the build if not. Stale copies from a previous build
    are deleted before `make`, so only a real overlay application can satisfy it.
-8. Generates `solarmatrix/out/openwrt-licenses.json` listing every
+9. Generates `solarmatrix/out/openwrt-licenses.json` listing every
    installed package's OSS license (per the build manifest).
-9. Copies firmware images to `solarmatrix/out/`.
+10. Copies firmware images to `solarmatrix/out/`.
 
 Both `version` and `files/` are generated at build time and removed again by
 the script's exit trap; it refuses to start if either already exists.

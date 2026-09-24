@@ -163,6 +163,9 @@ mkdir -p tmp
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
+# Two changes to the stock OpenWRT One DTS: userspace SPI access for the CAN
+# module, and a writable NOR partition for per-device secrets.
+#
 # The MCP2515 hangs off the mikroBUS SPI bus, which the stock OpenWRT One DTS
 # brings up with no child node -- so nothing binds to it and no /dev/spidev
 # ever appears. Three edits make it reachable from userspace:
@@ -175,10 +178,19 @@ mkdir -p tmp
 #     spidev_dt_ids and explicitly rejects a generic "spidev" compatible.
 #     See OpenWRT PR #17399.
 #
+# The NOR "factory" partition is split in two:
+#
+#   - factory shrinks to <0x40000 0xa0000>. It still holds the MACs and WiFi
+#     calibration and stays read-only.
+#   - factory-secrets <0xe0000 0x20000> (128 KiB, the previously erased tail
+#     of factory) is added before fip-nor. It is writable, so the provisioning
+#     tool can store per-device secrets there.
+#
 # The result is verified below rather than assumed: these are regex edits
 # against an upstream file, and a pattern that silently matched nothing would
-# otherwise yield firmware with no CAN access and no error anywhere in the log.
-step "Patching the OpenWRT One DTS for userspace SPI access"
+# otherwise yield firmware with no CAN access or no secrets partition, and no
+# error anywhere in the log.
+step "Patching the OpenWRT One DTS (userspace SPI, factory-secrets partition)"
 DTS="target/linux/mediatek/dts/mt7981b-openwrt-one.dts"
 if [ ! -f "$DTS" ]; then
     echo "ERROR: DTS not found: $DTS" >&2
