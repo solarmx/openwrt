@@ -185,6 +185,19 @@ run stage_artifacts "$B/bin/targets" "$O" "$V"
 assert_nonzero "$RC" "case 37: the first image failing to copy fails the staging"
 chmod 755 "$O/openwrt-$V-mediatek-filogic-openwrt_one-factory.ubi"
 
+# --- exactly one unreadable image, neither the first nor the last copied:
+# the images before it are staged, so everything after the loop
+# (profiles.json, sha256sums) would still succeed; the staging must not ---
+CASES=$((CASES + 1))
+mkstage
+BAD="$IMG/openwrt-$V-mediatek-filogic-openwrt_one-nor-bl31-uboot.fip"
+chmod 000 "$BAD"
+run stage_artifacts "$B/bin/targets" "$O" "$V"
+chmod 644 "$BAD"
+assert_nonzero "$RC" "case 41: one failed copy fails the staging"
+assert_contains "could not copy $BAD" "$OUT" "case 41: names the image"
+assert_eq absent "$([ -e "$O/sha256sums" ] && echo present || echo absent)" "case 41: no sha256sums written"
+
 # --- profiles.json is always produced (JSON_OVERVIEW_IMAGE_INFO default y) ---
 mkstage; rm "$IMG/profiles.json"
 expect_fail "case 38: no profiles.json" 'profiles.json is missing' stage_artifacts "$B/bin/targets" "$O" "$V"
@@ -195,6 +208,7 @@ for GATE in check_defconfig check_overlay_listed delete_stale_overlay find_rootf
             find_dtb check_overlay_in_rootfs check_rootfs_gates check_initramfs \
             reset_out_dir stage_artifacts; do
     assert_eq 1 "$(grep -c -E "^[^#]*\b$GATE\b" "$HERE/build-firmware.sh")" "case 39: build-firmware.sh calls $GATE once"
+    assert_eq 0 "$(grep -c -E "^[^#]*\b$GATE\b.*\|\|[[:space:]]*(true|:)([[:space:]]|;|\)|\$)" "$HERE/build-firmware.sh")" "case 39: $GATE's failure is not swallowed"
 done
 assert_eq "$(grep -c -E '^[a-z_]+\(\) \{' "$HERE/build-gates.sh")" 11 "case 39: the gate list above covers build-gates.sh (10 gates + gate_error)"
 for DTS_MODE in patch check-dtb; do
