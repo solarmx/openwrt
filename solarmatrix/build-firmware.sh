@@ -189,9 +189,17 @@ mkdir -p tmp
 # The result is verified below rather than assumed: these are regex edits
 # against an upstream file, and a pattern that silently matched nothing would
 # otherwise yield firmware with no CAN access or no secrets partition, and no
-# error anywhere in the log.
+# error anywhere in the log. The NOR partition table is then parsed and
+# checked as a whole, because a regex that matched in the wrong place could
+# still leave overlapping partitions or a writable factory.
+#
+# The tag checkout above keeps local modifications to files the tag also has,
+# so a DTS patched by an earlier run would be patched a second time. Restore
+# it first, and write the result only once every check has passed, so a failed
+# run never leaves a half-patched DTS behind.
 step "Patching the OpenWRT One DTS (userspace SPI, factory-secrets partition)"
 DTS="target/linux/mediatek/dts/mt7981b-openwrt-one.dts"
+git checkout -- "$DTS"
 if [ ! -f "$DTS" ]; then
     echo "ERROR: DTS not found: $DTS" >&2
     exit 1
@@ -232,7 +240,139 @@ text, n_secrets = re.subn(
               + m.group(1),
     text, count=1)
 
-path.write_text(text)
+# The NOR layout this firmware and the provisioning tool are built for.
+NOR_LAYOUT = [
+    ("bl2-nor", 0x0, 0x40000),
+    ("factory", 0x40000, 0xa0000),
+    ("factory-secrets", 0xe0000, 0x20000),
+    ("fip-nor", 0x100000, 0x80000),
+    ("recovery", 0x180000, 0xc80000),
+]
+# Cells the kernel reads MACs and WiFi calibration from, by unit address.
+FACTORY_CELLS = ("eeprom@0", "macaddr@4", "macaddr@24")
+
+
+def parse_node(s, i):
+    """Parses the DTS node body that starts just after its '{' at s[i].
+
+    Returns (node, index just past the closing '};'), where node is
+    {"props": {name: raw value, or True for a flag}, "children": [(name, node)]}.
+    """
+    props, children = {}, []
+    while True:
+        i = re.compile(r"\s*").match(s, i).end()
+        if i >= len(s):
+            raise ValueError("unterminated node")
+        if s[i] == "}":
+            end = re.compile(r"\}\s*;").match(s, i)
+            if not end:
+                raise ValueError("node not closed with '};'")
+            return {"props": props, "children": children}, end.end()
+        j = i
+        while j < len(s) and s[j] not in "{;}":
+            if s[j] == '"':
+                j = s.index('"', j + 1)
+            j += 1
+        if j >= len(s) or s[j] == "}":
+            raise ValueError("statement not terminated: %r" % s[i:j][:40])
+        head = s[i:j].strip()
+        if s[j] == "{":
+            child, i = parse_node(s, j + 1)
+            children.append((head.split(":")[-1].strip(), child))
+        else:
+            name, eq, value = head.partition("=")
+            props[name.strip()] = value.strip() if eq else True
+            i = j + 1
+
+
+def child(node, name):
+    return next((c for n, c in node["children"] if n == name), None)
+
+
+def num(token):
+    return int(token, 16) if token.lower().startswith("0x") else int(token)
+
+
+def reg_of(node):
+    m = re.fullmatch(r"<\s*(\S+)\s+(\S+)\s*>", str(node["props"].get("reg", "")))
+    if not m:
+        return None
+    try:
+        return num(m.group(1)), num(m.group(2))
+    except ValueError:
+        return None
+
+
+def nor_problems(text):
+    """Checks the NOR partition table under &spi2 flash@0 as a whole."""
+    refs = list(re.finditer(r"&spi2\s*\{", text))
+    if len(refs) != 1:
+        return ["expected one &spi2 node, found %d" % len(refs)]
+    body = re.sub(r"/\*.*?\*/|//[^\n]*", "", text[refs[0].end():], flags=re.S)
+    try:
+        spi2, _ = parse_node(body, 0)
+    except ValueError as e:
+        return ["cannot parse &spi2: %s" % e]
+    flash = child(spi2, "flash@0")
+    table = flash and child(flash, "partitions")
+    if not table:
+        return ["&spi2 has no flash@0 { partitions { ... } } block"]
+
+    problems, parts = [], []
+    for name, node in table["children"]:
+        if not name.startswith("partition@"):
+            continue
+        label = str(node["props"].get("label", "")).strip('"')
+        reg = reg_of(node)
+        if reg is None:
+            problems.append("NOR %s (%s) has no parsable reg" % (name, label))
+            continue
+        if num("0x" + name.split("@", 1)[1]) != reg[0]:
+            problems.append("NOR %s (%s) unit address does not match its reg "
+                            "offset 0x%x" % (name, label, reg[0]))
+        parts.append((label, reg[0], reg[1], node))
+    parts.sort(key=lambda p: p[1])
+
+    labels = [p[0] for p in parts]
+    for label in sorted(set(labels)):
+        if labels.count(label) > 1:
+            problems.append("NOR partition %s appears %d times"
+                            % (label, labels.count(label)))
+    for a, b in zip(parts, parts[1:]):
+        a_end = a[1] + a[2]
+        if a_end > b[1]:
+            problems.append("NOR partition %s (0x%x-0x%x) overlaps %s (starts 0x%x)"
+                            % (a[0], a[1], a_end - 1, b[0], b[1]))
+        elif a_end < b[1]:
+            problems.append("NOR gap between %s (ends 0x%x) and %s (starts 0x%x)"
+                            % (a[0], a_end - 1, b[0], b[1]))
+    if [p[:3] for p in parts] != NOR_LAYOUT:
+        fmt = lambda ps: ", ".join("%s 0x%x+0x%x" % p[:3] for p in ps)
+        problems.append("NOR partitions are [%s], expected [%s]"
+                        % (fmt(parts), fmt(NOR_LAYOUT)))
+
+    by_label = {p[0]: p for p in parts}
+    factory = by_label.get("factory")
+    if factory:
+        if "read-only" not in factory[3]["props"]:
+            problems.append("factory is not read-only; its MACs and WiFi "
+                            "calibration would be writable")
+        layout = child(factory[3], "nvmem-layout") or {"children": []}
+        for cell_name in FACTORY_CELLS:
+            cell = child(layout, cell_name)
+            reg = cell and reg_of(cell)
+            if not cell:
+                problems.append("factory nvmem cell %s is missing" % cell_name)
+            elif (not reg or reg[0] != num("0x" + cell_name.split("@")[1])
+                  or reg[0] + reg[1] > factory[2]):
+                problems.append("factory nvmem cell %s is not at its unit "
+                                "address inside factory" % cell_name)
+    secrets = by_label.get("factory-secrets")
+    if secrets and "read-only" in secrets[3]["props"]:
+        problems.append("factory-secrets is read-only; the provisioning tool "
+                        "could not write it")
+    return problems
+
 
 problems = []
 if "spidev@0" not in text:
@@ -247,16 +387,19 @@ if n_factory != 1:
     problems.append("factory partition was not shrunk to 0x40000 0xa0000")
 if n_secrets != 1 or 'label = "factory-secrets"' not in text:
     problems.append("factory-secrets partition was not added before fip-nor")
+problems += nor_problems(text)
 
 if problems:
     sys.stderr.write("ERROR: DTS patch did not apply cleanly to %s:\n" % tag)
     for problem in problems:
         sys.stderr.write("  - %s\n" % problem)
-    sys.stderr.write("  The upstream DTS likely changed shape in this release.\n")
+    sys.stderr.write("  The upstream DTS likely changed shape in this release.\n"
+                     "  %s was left unmodified.\n" % path)
     raise SystemExit(1)
 
+path.write_text(text)
 print("Verified: spidev@0 added, mikrobus-reset removed, uart2 disabled, "
-      "factory split into factory + factory-secrets")
+      "factory split into factory + factory-secrets, NOR table contiguous")
 PY
 
 step "Writing .config for OpenWRT One (mediatek/filogic)"
