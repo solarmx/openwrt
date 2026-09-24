@@ -19,11 +19,12 @@ The source edits:
 
 The NOR table is then checked as a whole, because the kernel's ofpart parser
 treats every child of the fixed-partitions node that has a reg as an MTD
-partition, whatever it is called. The source check refuses anything that
-could change the table from outside the &spi2 block (/delete-*/ directives,
-&{/path} references, overrides of labels defined in it). It is only the early
-failure: dtc resolves includes and overrides the source check cannot see, so
-the build checks the compiled DTB with the same table rules.
+partition, whatever it is called. The source check refuses the common ways
+to change the table from outside the &spi2 block: /delete-*/ directives
+inside &spi2, &{/path} references, and `&label {` overrides of labels
+defined in it. It does not catch every form (a top-level
+`/delete-node/ &label;` passes it), so it is only the early failure; the
+check of the compiled DTB, which sees what dtc resolved, is authoritative.
 """
 import re
 import subprocess
@@ -253,8 +254,9 @@ def legacy_partitions(flash):
 
 
 def nor_flash_problems(ctrl, ctrl_path):
-    """Checks the NOR on controller ctrl: its one enabled CS0 child (by reg,
-    not by node name) and that child's partition table.
+    """Checks the NOR on controller ctrl: its one CS0 child (by reg, not by
+    node name, and counted whatever its status), which must be enabled, and
+    that child's partition table.
 
     Returns (path of the checked table or None, problems).
     """
